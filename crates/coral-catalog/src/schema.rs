@@ -805,6 +805,15 @@ impl<'a> TypeScriptProjector<'a> {
             return Ok(if allowed { "unknown" } else { "never" }.to_string());
         }
         let object = schema.as_object().ok_or_else(invalid_schema)?;
+        if !self.graph.semantics().nullable_applies()
+            && declares_nullable(object)
+            && !type_admits_null(object)
+        {
+            self.warn(
+                "nullable_ignored",
+                "nullable has no effect in JSON Schema; include null in type instead",
+            );
+        }
         if let Some(reference) = object.get("$ref") {
             let reference = reference.as_str().ok_or_else(invalid_schema_reference)?;
             let id = SchemaId::from_storage(reference.to_string())
@@ -843,7 +852,7 @@ impl<'a> TypeScriptProjector<'a> {
                 );
                 "unknown".to_string()
             });
-            return Ok(with_nullable(object, projected));
+            return Ok(self.with_nullable(object, projected));
         }
         if let Some(enumeration) = object.get("enum") {
             let values = enumeration.as_array().ok_or_else(invalid_schema)?;
@@ -861,7 +870,7 @@ impl<'a> TypeScriptProjector<'a> {
                 },
                 |values| values.join(" | "),
             );
-            return Ok(with_nullable(object, projected));
+            return Ok(self.with_nullable(object, projected));
         }
         for keyword in ["oneOf", "anyOf"] {
             if let Some(branches) = object.get(keyword) {
@@ -873,7 +882,7 @@ impl<'a> TypeScriptProjector<'a> {
                     .iter()
                     .map(|branch| self.project_schema(branch, direction))
                     .collect::<Result<Vec<_>, _>>()
-                    .map(|types| format!("({})", types.join(" | ")));
+                    .map(|types| self.with_nullable(object, format!("({})", types.join(" | "))));
             }
         }
         if let Some(branches) = object.get("allOf") {
@@ -885,7 +894,7 @@ impl<'a> TypeScriptProjector<'a> {
                 .iter()
                 .map(|branch| self.project_schema(branch, direction))
                 .collect::<Result<Vec<_>, _>>()
-                .map(|types| format!("({})", types.join(" & ")));
+                .map(|types| self.with_nullable(object, format!("({})", types.join(" & "))));
         }
         if object.contains_key("not")
             || object.contains_key("if")
@@ -899,11 +908,7 @@ impl<'a> TypeScriptProjector<'a> {
             return Ok("unknown".to_string());
         }
 
-        let nullable = object
-            .get("nullable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let mut projected = match object.get("type") {
+        let projected = match object.get("type") {
             Some(Value::Array(types)) => {
                 let mut projections = Vec::new();
                 for kind in types {
@@ -924,9 +929,7 @@ impl<'a> TypeScriptProjector<'a> {
             }
             None => "unknown".to_string(),
         };
-        if nullable {
-            projected = with_nullable(object, projected);
-        }
+        let projected = self.with_nullable(object, projected);
         self.warn_unrepresented_constraints(object);
         Ok(projected)
     }
@@ -1131,6 +1134,17 @@ impl<'a> TypeScriptProjector<'a> {
         }
     }
 
+    fn with_nullable(&self, schema: &Map<String, Value>, projected: String) -> String {
+        if self.graph.semantics().nullable_applies()
+            && declares_nullable(schema)
+            && !projected.split(" | ").any(|kind| kind == "null")
+        {
+            format!("{projected} | null")
+        } else {
+            projected
+        }
+    }
+
     fn warn(&mut self, code: &'static str, message: &'static str) {
         if self.diagnostic_codes.insert(code) {
             self.diagnostics
@@ -1304,13 +1318,16 @@ fn cyclic_alias_indices(edges: &[Vec<usize>]) -> Vec<usize> {
         .collect()
 }
 
-fn with_nullable(schema: &Map<String, Value>, projected: String) -> String {
-    if schema.get("nullable").and_then(Value::as_bool) == Some(true)
-        && !projected.split(" | ").any(|kind| kind == "null")
-    {
-        format!("{projected} | null")
-    } else {
-        projected
+/// Whether a schema sets OpenAPI 3.0's `nullable` keyword.
+pub(crate) fn declares_nullable(schema: &Map<String, Value>) -> bool {
+    schema.get("nullable").and_then(Value::as_bool) == Some(true)
+}
+
+fn type_admits_null(schema: &Map<String, Value>) -> bool {
+    match schema.get("type") {
+        Some(Value::String(kind)) => kind == "null",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "null"),
+        _ => false,
     }
 }
 

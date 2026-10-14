@@ -754,15 +754,120 @@ paths:
     );
 }
 
+/// One schema's expected behaviour under the `nullable` rules.
+struct NullableCase {
+    version: &'static str,
+    schema: &'static str,
+    /// The projected response data type, or `None` to leave it unchecked.
+    projection: Option<&'static str>,
+    accepts_null: bool,
+    /// A string the schema must still reject.
+    rejects: Option<&'static str>,
+    warns: bool,
+    /// Whether a `text/plain` request body with this schema stays available,
+    /// or `None` to leave it unchecked.
+    text_body_available: Option<bool>,
+}
+
+const NULLABLE_CASES: [NullableCase; 9] = [
+    NullableCase {
+        version: "3.0.3",
+        schema: "{ type: string, nullable: true }",
+        projection: Some("string | null"),
+        accepts_null: true,
+        rejects: None,
+        warns: false,
+        // Null has no text form.
+        text_body_available: Some(false),
+    },
+    NullableCase {
+        version: "3.0.3",
+        schema: "{ type: string, enum: [open], nullable: true }",
+        projection: Some("\"open\" | null"),
+        accepts_null: true,
+        rejects: Some("closed"),
+        warns: false,
+        text_body_available: None,
+    },
+    NullableCase {
+        version: "3.0.3",
+        schema: "{ oneOf: [{ type: string }, { type: boolean }], nullable: true }",
+        projection: Some("(string | boolean) | null"),
+        accepts_null: true,
+        rejects: None,
+        warns: false,
+        text_body_available: None,
+    },
+    NullableCase {
+        version: "3.0.3",
+        schema: "{ allOf: [{ type: string }], nullable: true }",
+        projection: Some("(string) | null"),
+        accepts_null: true,
+        rejects: None,
+        warns: false,
+        text_body_available: None,
+    },
+    NullableCase {
+        version: "3.1.0",
+        schema: "{ type: string, nullable: true }",
+        projection: Some("string"),
+        accepts_null: false,
+        rejects: None,
+        warns: true,
+        text_body_available: Some(true),
+    },
+    NullableCase {
+        version: "3.1.0",
+        schema: "{ type: string, enum: [open], nullable: true }",
+        projection: Some("\"open\""),
+        accepts_null: false,
+        rejects: Some("closed"),
+        warns: true,
+        text_body_available: None,
+    },
+    NullableCase {
+        version: "3.1.0",
+        // OpenAI's shape: a reference made "nullable" by an `allOf` sibling.
+        schema: "{ allOf: [{ $ref: \"#/components/schemas/Truncation\" }, { nullable: true }] }",
+        projection: Some("(Truncation & unknown)"),
+        accepts_null: false,
+        rejects: None,
+        warns: true,
+        text_body_available: None,
+    },
+    NullableCase {
+        version: "3.1.0",
+        schema: "{ type: [string, \"null\"] }",
+        projection: Some("null | string"),
+        accepts_null: true,
+        rejects: None,
+        warns: false,
+        text_body_available: None,
+    },
+    // The type already admits null, so `nullable` changes nothing.
+    NullableCase {
+        version: "3.1.0",
+        schema: "{ type: [string, \"null\"], nullable: true }",
+        projection: Some("null | string"),
+        accepts_null: true,
+        rejects: None,
+        warns: false,
+        text_body_available: None,
+    },
+];
+
+/// OpenAPI 3.0's `nullable` admits null. OpenAPI 3.1 gives it no meaning, so
+/// the projection and the validator both ignore it, and materialization warns.
 #[test]
-fn openapi_30_nullable_enum_includes_null() {
-    let prepared = ready(
-        r#"openapi: 3.0.3
-info:
-  title: Nullable enum
-  version: "1"
-servers:
-  - url: https://api.example.test
+fn nullable_follows_the_declared_openapi_version() {
+    for case in NULLABLE_CASES {
+        let NullableCase {
+            version, schema, ..
+        } = case;
+        let prepared = ready(&format!(
+            r#"openapi: {version}
+info: {{ title: Nullable, version: "1" }}
+servers: [{{ url: https://api.example.test }}]
 paths:
   /state:
     get:
@@ -772,34 +877,63 @@ paths:
           description: state
           content:
             application/json:
-              schema:
-                type: string
-                enum: [open]
-                nullable: true
-"#,
-    );
-    assert_eq!(
-        prepared.schema_graph().semantics(),
-        coral_catalog::SchemaSemantics::OpenApiV3_0
-    );
-    let operation = &prepared.operations()[0];
-    assert!(
-        operation
-            .typescript_declaration()
-            .contains("\"open\" | null")
-    );
-    let schema = http_binding(operation).responses()[0].content()[0].schema();
-    assert!(prepared.schema_graph().accepts(schema, &Value::Null));
-    assert!(
-        prepared
-            .schema_graph()
-            .accepts(schema, &Value::from("open"))
-    );
-    assert!(
-        !prepared
-            .schema_graph()
-            .accepts(schema, &Value::from("closed"))
-    );
+              schema: {schema}
+components:
+  schemas:
+    Truncation: {{ type: string }}
+"#
+        ));
+        let operation = &prepared.operations()[0];
+        let response = http_binding(operation).responses()[0].content()[0].schema();
+        let graph = prepared.schema_graph();
+        assert_eq!(
+            (
+                case.projection.is_none_or(|projection| {
+                    operation
+                        .typescript_declaration()
+                        .contains(&format!("HttpResult<{projection}, 200,"))
+                }),
+                graph.accepts(response, &Value::Null),
+                graph.accepts(response, &Value::from("open")),
+                case.rejects
+                    .is_none_or(|rejected| !graph.accepts(response, &Value::from(rejected))),
+                operation
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code() == "nullable_ignored"),
+            ),
+            (true, case.accepts_null, true, true, case.warns),
+            "{version} {schema}\n{}",
+            operation.typescript_declaration()
+        );
+
+        if let Some(available) = case.text_body_available {
+            let prepared = ready(&format!(
+                r#"openapi: {version}
+info: {{ title: Nullable text, version: "1" }}
+servers: [{{ url: https://api.example.test }}]
+paths:
+  /state:
+    post:
+      operationId: setState
+      requestBody:
+        content:
+          text/plain:
+            schema: {schema}
+      responses: {{ "204": {{ description: set }} }}
+"#
+            ));
+            assert_eq!(
+                prepared.operations()[0].availability(),
+                if available {
+                    OperationAvailability::Available
+                } else {
+                    OperationAvailability::Unavailable
+                },
+                "{version} {schema} as a text/plain request body"
+            );
+        }
+    }
 }
 
 #[test]
