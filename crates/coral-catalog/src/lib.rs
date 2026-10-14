@@ -316,21 +316,22 @@ pub async fn operation_in_transaction(
     repository::load_operation(transaction, generation_id, operation_key).await
 }
 
-/// Reads hints for 1–100 exact keys without loading executable definitions or schemas.
+/// Reads hints and the HTTP method for 1–100 exact keys without loading
+/// executable definitions or schemas. The method is `None` for other protocols.
 /// Absent keys are omitted; structurally unavailable Operations remain included.
 /// # Errors
 /// Returns invalid-size, persistence or corrupt-generation failures.
-pub async fn operation_hints_in_transaction(
+pub async fn operation_hints_and_methods_in_transaction(
     transaction: &mut Transaction<'_>,
     generation_id: &ProviderGenerationId,
     keys: &[OperationKey],
-) -> Result<std::collections::BTreeMap<OperationKey, OperationHints>, Error> {
+) -> Result<std::collections::BTreeMap<OperationKey, (OperationHints, Option<HttpMethod>)>, Error> {
     if !(1..=100).contains(&keys.len()) {
         return Err(Error::InvalidInput(
             "invalid Operation hints batch size".into(),
         ));
     }
-    repository::load_operation_hints(transaction, generation_id, keys).await
+    repository::load_operation_hints_and_methods(transaction, generation_id, keys).await
 }
 
 /// Reads one summary page in Operation Key order, plus at most one lookahead row.
