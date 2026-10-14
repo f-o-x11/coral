@@ -24,6 +24,7 @@ import type {
   ProviderSourceView,
 } from './types'
 import { accountStates } from '@/views/accounts/account-states'
+import { ConnectAccountDialog } from '@/views/management/connect-account-dialog'
 import { accountLabels, useAccountAudience } from './account-labels'
 import { SourceUrl, sourceKinds } from './source-facts'
 import * as styles from './providers.css'
@@ -234,10 +235,13 @@ function AccountSection({
   const required = provider.account !== 'none'
   const shared = provider.account === 'fixed'
   const connected = provider.connection === 'connected'
-  // Your own account has its page under Accounts; owners manage the shared one here.
+  // Your own account has its page under Accounts, which brings you back here;
+  // owners manage the shared one under the provider.
   const accountsPath = shared
     ? `${provider.path}/accounts?scope=shared`
-    : `${workspacePath}/accounts/${provider.id}`
+    : `${workspacePath}/accounts/${provider.id}?${new URLSearchParams({
+        returnTo: `${provider.path}/settings`,
+      })}`
   const whose = shared ? 'shared account' : 'your account'
   // Members cannot open the shared account; only its owners connect it.
   const canOpen = required && (!shared || owner)
@@ -247,21 +251,40 @@ function AccountSection({
       {`Manage ${whose}`}
     </Button.InternalLink>
   )
-  const connection = !canOpen ? null : provider.connection === 'connected' ||
-    provider.connection === 'unknown' ? (
-    manage
-  ) : reconnect && provider.canReconnect ? (
+  // What the reader may do with the account: connect it, reconnect it, or neither.
+  const verb =
+    !canOpen || provider.connection === 'connected' || provider.connection === 'unknown'
+      ? null
+      : reconnect
+        ? provider.canReconnect
+          ? 'Reconnect'
+          : null
+        : active && provider.canConnect
+          ? 'Connect'
+          : null
+  const link = verb && (
     <Button.InternalLink to={accountsPath} variant="primary" size="small">
-      {`Reconnect ${whose}`}
+      {`${verb} ${whose}`}
     </Button.InternalLink>
-  ) : reconnect ? (
-    // Coral refuses this reader a reconnect; the account can still be opened.
-    manage
-  ) : active && provider.canConnect ? (
-    <Button.InternalLink to={accountsPath} variant="primary" size="small">
-      {`Connect ${whose}`}
-    </Button.InternalLink>
-  ) : null
+  )
+  // Your own account connects in a dialog on this page, as an agent's does.
+  // Mounted while it is connected too, so an open dialog sees the account land.
+  const connection = !canOpen ? null : shared ? (
+    (link ?? (provider.connection === 'not_connected' && !reconnect ? null : manage))
+  ) : (
+    <ConnectAccountDialog
+      provider={provider.id}
+      providerName={provider.displayName}
+      namespace={provider.namespace}
+      form={form}
+      connectable={verb !== null}
+      reconnect={verb === 'Reconnect'}
+      ready={connected}
+      fallback={provider.connection === 'not_connected' && !reconnect ? null : manage}
+      trigger={{ label: `${verb ?? 'Connect'} ${whose}`, variant: 'primary', size: '32' }}
+      description={audience.onlyYou}
+    />
+  )
   const canChange = owner && active
   return (
     <section aria-label="Account">
