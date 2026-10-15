@@ -8,6 +8,7 @@ import { IconButton } from '@/wax/components/button/icon-button'
 import { Icon } from '@/wax/components/icon'
 import { Pill } from '@/wax/components/pill/pill'
 
+import { InfoTip } from './info-tip'
 import { Tooltip } from './tooltip'
 
 const meta: Meta<typeof Tooltip> = {
@@ -43,6 +44,26 @@ export const WithIcon: Story = {
       </Tooltip>
     </div>
   ),
+}
+
+export const WithInfoTip: Story = {
+  render: () => (
+    <div style={{ display: 'flex', gap: '24px', padding: '48px' }}>
+      <InfoTip label="Workspace members">
+        As a member, you see only yourself and the owners. Owners see all members.
+      </InfoTip>
+      <InfoTip>Shows an icon alone when there is no label.</InfoTip>
+    </div>
+  ),
+  // Checks that a touch press opens the explanation. A simulated tap also
+  // focuses the trigger, and focus opens a Tooltip too, so this does not
+  // catch a Tooltip-based InfoTip. Only real touch input does.
+  play: async ({ canvas }) => {
+    const target = canvas.getByRole('button', { name: 'Workspace members' })
+    await userEvent.pointer({ keys: '[TouchA]', target })
+    const text = await within(document.body).findByText(/Owners see all members\./)
+    await waitFor(() => expect(text).toBeVisible())
+  },
 }
 
 export const AllSides: Story = {
