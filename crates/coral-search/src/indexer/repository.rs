@@ -3,14 +3,16 @@
 //! Every function joins the caller's transaction; [`crate::SearchIndex`] owns
 //! when each transaction begins, commits, or rolls back.
 
+use std::collections::HashSet;
+
 use coral_catalog::{OperationKey, ProviderGenerationId};
 use coral_db::{DatabaseSystem, Error, Transaction};
 use coral_functions::SavedFunctionId;
 use coral_provider::ProviderId;
 use coral_workspace::{Principal, WorkspaceId};
 use sea_query::{
-    Alias, Asterisk, DeleteStatement, Expr, ExprTrait as _, Func, Iden, JoinType, OnConflict,
-    Query, SimpleExpr,
+    Alias, Asterisk, BinOper, Cond, DeleteStatement, Expr, ExprTrait as _, Func, Iden, JoinType,
+    OnConflict, Query, SimpleExpr,
 };
 
 use super::IndexError;
@@ -18,7 +20,7 @@ use crate::CallPath;
 
 /// The `search_entities` table and its columns, for sea-query. Each row is
 /// one Search Entity that indexed: an Operation or a Saved Function.
-#[derive(Iden)]
+#[derive(Clone, Copy, Iden)]
 enum SearchEntities {
     Table,
     WorkspaceId,
@@ -38,7 +40,11 @@ enum SearchEntities {
     SearchableText,
     Deprecated,
     Fingerprint,
+    /// When the row last changed: the attempt that wrote its values.
     IndexedAtUnixNanos,
+    /// The row's vector length, on Postgres only. A write that changes the
+    /// row clears it, and the indexer then counts it again.
+    DocLen,
 }
 
 /// The `search_index_states` table and its columns, for sea-query. Each row
@@ -77,8 +83,9 @@ const SAVED_FUNCTION: &str = "saved_function";
 const COMPLETE: &str = "complete";
 const FAILED: &str = "failed";
 
-/// Rows per upsert statement, well under each backend's bind limit.
-const UPSERT_CHUNK_ROWS: usize = 500;
+/// Rows per upsert or delete statement, well under each backend's bind
+/// limit.
+const CHUNK_ROWS: usize = 500;
 
 /// The class of the Postgres advisory lock on one Workspace's search index
 /// writes, ASCII `srch`. The second key is the hash of the Workspace id. The
@@ -152,11 +159,15 @@ pub(super) struct OperationRow<'a> {
 }
 
 impl OperationRow<'_> {
+    fn doc_id(&self) -> String {
+        format!("{}:{}", self.generation_id, self.operation_key.as_str())
+    }
+
     fn values(&self) -> [SimpleExpr; OPERATION_COLUMNS.len()] {
         let generation_id = self.generation_id.to_string();
         [
             self.workspace_id.to_string().into(),
-            format!("{generation_id}:{}", self.operation_key.as_str()).into(),
+            self.doc_id().into(),
             OPERATION.into(),
             self.provider_id.to_string().into(),
             generation_id.clone().into(),
@@ -191,14 +202,15 @@ pub(super) struct GenerationState<'a> {
     pub(super) state: AttemptState,
 }
 
-/// Upserts Operation rows by Workspace and document id. An update, never
-/// `INSERT OR REPLACE`: on `SQLite` a replace skips the delete trigger and
-/// leaves a stale copy in the FTS5 table.
+/// Upserts Operation rows by Workspace and document id, as
+/// [`changed_rows_only`] describes. An update, never `INSERT OR REPLACE`: on
+/// `SQLite` a replace skips the delete trigger and leaves a stale copy in
+/// the FTS5 table.
 pub(super) async fn upsert_operation_rows(
     transaction: &mut Transaction<'_>,
     rows: &[OperationRow<'_>],
 ) -> Result<(), Error> {
-    for chunk in rows.chunks(UPSERT_CHUNK_ROWS) {
+    for chunk in rows.chunks(CHUNK_ROWS) {
         let mut statement = Query::insert();
         statement
             .into_table(SearchEntities::Table)
@@ -206,33 +218,83 @@ pub(super) async fn upsert_operation_rows(
         for row in chunk {
             statement.values_panic(row.values());
         }
-        statement.on_conflict(
-            OnConflict::columns([SearchEntities::WorkspaceId, SearchEntities::DocId])
-                .update_columns(OPERATION_COLUMNS.into_iter().skip(2))
-                .to_owned(),
-        );
+        statement.on_conflict(changed_rows_only(transaction.system(), OPERATION_COLUMNS));
         transaction.execute(statement).await?;
     }
     Ok(())
 }
 
-/// Deletes the Generation's rows that an attempt at `attempted_at` did not
-/// write.
+/// The conflict action of a row upsert: it updates a conflicting row only
+/// when the insert brings another value for a column other than the key and
+/// the stamp. A row whose values stay the same keeps its stamp and its
+/// version, and no trigger fires for it. On Postgres the update also clears
+/// `doc_len`, so the length refresh counts that row again.
+///
+/// Both databases compare with `IS DISTINCT FROM`, so two NULLs are equal.
+/// `SQLite` has it from 3.39; the bundled build is newer.
+///
+/// `columns` opens with the two key columns and ends with the stamp.
+fn changed_rows_only<const N: usize>(
+    system: DatabaseSystem,
+    columns: [SearchEntities; N],
+) -> OnConflict {
+    let changed = columns
+        .into_iter()
+        .skip(2)
+        .filter(|column| !matches!(column, SearchEntities::IndexedAtUnixNanos))
+        .fold(Cond::any(), |changed, column| {
+            changed.add(Expr::col((SearchEntities::Table, column)).binary(
+                BinOper::Custom("IS DISTINCT FROM"),
+                Expr::col((Alias::new("excluded"), column)),
+            ))
+        });
+    let mut on_conflict = OnConflict::columns([SearchEntities::WorkspaceId, SearchEntities::DocId]);
+    on_conflict.update_columns(columns.into_iter().skip(2));
+    if system == DatabaseSystem::Postgres {
+        on_conflict.value(SearchEntities::DocLen, Expr::null());
+    }
+    on_conflict.action_and_where(changed.into());
+    on_conflict
+}
+
+/// Deletes the Generation's rows whose document id is not among `rows`, the
+/// rows an attempt wrote or kept.
 pub(super) async fn delete_rows_not_written(
     transaction: &mut Transaction<'_>,
     workspace_id: &WorkspaceId,
     generation_id: &ProviderGenerationId,
-    attempted_at_unix_nanos: i64,
+    rows: &[OperationRow<'_>],
 ) -> Result<(), Error> {
-    transaction
-        .execute(
-            generation_rows(workspace_id, generation_id)
+    let written = rows
+        .iter()
+        .map(OperationRow::doc_id)
+        .collect::<HashSet<_>>();
+    let indexed: Vec<(String,)> = transaction
+        .fetch_all(
+            Query::select()
+                .column(SearchEntities::DocId)
+                .from(SearchEntities::Table)
+                .and_where(Expr::col(SearchEntities::WorkspaceId).eq(workspace_id.to_string()))
                 .and_where(
-                    Expr::col(SearchEntities::IndexedAtUnixNanos).ne(attempted_at_unix_nanos),
+                    Expr::col(SearchEntities::ProviderGenerationId).eq(generation_id.to_string()),
                 )
                 .to_owned(),
         )
         .await?;
+    let stale = indexed
+        .into_iter()
+        .map(|(doc_id,)| doc_id)
+        .filter(|doc_id| !written.contains(doc_id))
+        .collect::<Vec<_>>();
+    for chunk in stale.chunks(CHUNK_ROWS) {
+        transaction
+            .execute(
+                generation_rows(workspace_id, generation_id)
+                    .and_where(Expr::col(SearchEntities::DocId).is_in(chunk.iter().cloned()))
+                    .to_owned(),
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -461,23 +523,21 @@ pub(super) struct FailedFunctionState<'a> {
     pub(super) error: String,
 }
 
-/// Upserts a Saved Function row by Workspace and document id. An update,
-/// never `INSERT OR REPLACE`, for the reason [`upsert_operation_rows`] gives.
+/// Upserts a Saved Function row by Workspace and document id, as
+/// [`changed_rows_only`] describes. An update, never `INSERT OR REPLACE`,
+/// for the reason [`upsert_operation_rows`] gives.
 pub(super) async fn upsert_function_row(
     transaction: &mut Transaction<'_>,
     row: &FunctionRow<'_>,
 ) -> Result<(), Error> {
+    let on_conflict = changed_rows_only(transaction.system(), FUNCTION_COLUMNS);
     transaction
         .execute(
             Query::insert()
                 .into_table(SearchEntities::Table)
                 .columns(FUNCTION_COLUMNS)
                 .values_panic(row.values())
-                .on_conflict(
-                    OnConflict::columns([SearchEntities::WorkspaceId, SearchEntities::DocId])
-                        .update_columns(FUNCTION_COLUMNS.into_iter().skip(2))
-                        .to_owned(),
-                )
+                .on_conflict(on_conflict)
                 .to_owned(),
         )
         .await?;
@@ -918,8 +978,10 @@ fn parse_workspace_id(value: &str) -> Result<WorkspaceId, IndexError> {
         .map_err(|_error| IndexError::Corrupt("a search index row has an invalid Workspace id"))
 }
 
-/// On Postgres, recomputes `doc_len` for one Generation's rows: the number of
-/// lexeme positions in the row's vector. `SQLite` needs none.
+/// On Postgres, counts `doc_len` for each of one Generation's rows that has
+/// none: the number of lexeme positions in the row's vector. An insert and
+/// an update leave the length empty; a row the write kept keeps its length.
+/// `SQLite` needs none.
 pub(super) async fn refresh_generation_lengths(
     transaction: &mut Transaction<'_>,
     workspace_id: &WorkspaceId,
@@ -935,7 +997,8 @@ pub(super) async fn refresh_generation_lengths(
                  SELECT sum(coalesce(array_length(u.positions, 1), 1)) \
                  FROM unnest(d.tsv) AS u(lexeme, positions, weights) \
              ), 0) \
-             WHERE d.workspace_id = $1 AND d.provider_generation_id = $2",
+             WHERE d.workspace_id = $1 AND d.provider_generation_id = $2 \
+               AND d.doc_len IS NULL",
             sea_query::Values(vec![
                 workspace_id.to_string().into(),
                 generation_id.to_string().into(),
@@ -945,8 +1008,8 @@ pub(super) async fn refresh_generation_lengths(
     Ok(())
 }
 
-/// On Postgres, recomputes `doc_len` for one Saved Function's row, as
-/// [`refresh_generation_lengths`] does for a Generation's.
+/// On Postgres, counts `doc_len` for one Saved Function's row when it has
+/// none, as [`refresh_generation_lengths`] does for a Generation's.
 pub(super) async fn refresh_function_length(
     transaction: &mut Transaction<'_>,
     workspace_id: &WorkspaceId,
@@ -962,7 +1025,8 @@ pub(super) async fn refresh_function_length(
                  SELECT sum(coalesce(array_length(u.positions, 1), 1)) \
                  FROM unnest(d.tsv) AS u(lexeme, positions, weights) \
              ), 0) \
-             WHERE d.workspace_id = $1 AND d.saved_function_id = $2",
+             WHERE d.workspace_id = $1 AND d.saved_function_id = $2 \
+               AND d.doc_len IS NULL",
             sea_query::Values(vec![
                 workspace_id.to_string().into(),
                 function_id.to_string().into(),
