@@ -181,6 +181,7 @@ impl TestObservers {
 pub struct RunModule {
     accounts: Option<coral_provider::account::AccountModule>,
     providers: coral_provider::ProviderModule,
+    provider_publisher: Option<Arc<dyn coral_provider::WorkspaceProviderPublisher>>,
     human_interface: Option<HumanInterfaceUrl>,
     database: Arc<Database>,
     workspaces: WorkspaceModule,
@@ -211,6 +212,7 @@ impl RunModule {
     ) -> Result<Self, Error> {
         Ok(Self {
             providers,
+            provider_publisher: None,
             human_interface: None,
             database,
             workspaces,
@@ -240,6 +242,7 @@ impl RunModule {
     ) -> Self {
         Self {
             providers,
+            provider_publisher: None,
             human_interface: None,
             database,
             workspaces,
@@ -260,6 +263,18 @@ impl RunModule {
     #[must_use]
     pub fn with_accounts(mut self, accounts: coral_provider::account::AccountModule) -> Self {
         self.accounts = Some(accounts);
+        self
+    }
+
+    /// Lets `coral.workspace.createProvider` publish a Provider that needs nobody to
+    /// sign in, through the workflow Reef publishes with. Without it, such a
+    /// call fails with `operation_unavailable`.
+    #[must_use]
+    pub fn with_provider_publisher(
+        mut self,
+        publisher: Arc<dyn coral_provider::WorkspaceProviderPublisher>,
+    ) -> Self {
+        self.provider_publisher = Some(publisher);
         self
     }
 
