@@ -357,7 +357,12 @@ impl Fixture {
             loopback_policy(),
             database.clone(),
             workspaces.clone(),
-            ProviderModule::new(loopback_policy(), database.clone(), workspaces.clone()),
+            ProviderModule::new(
+                loopback_policy(),
+                database.clone(),
+                workspaces.clone(),
+                coral_catalog::BuiltinCatalog::running().expect("the built-in catalog prepares"),
+            ),
             coral_run::IsolateLimits::default(),
         )
         .unwrap();

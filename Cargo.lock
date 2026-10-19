@@ -621,6 +621,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -704,6 +705,7 @@ dependencies = [
 name = "coral-catalog"
 version = "1.1.0"
 dependencies = [
+ "coral-catalog",
  "coral-db",
  "coral-outbound",
  "coral-test-support",

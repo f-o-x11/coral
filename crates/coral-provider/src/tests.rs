@@ -217,7 +217,7 @@ pub(crate) fn publication_request(
 
 pub(crate) async fn test_modules() -> (TestDatabase, WorkspaceModule, ProviderModule) {
     let (fixture, database, workspaces) = test_foundation().await;
-    let providers = ProviderModule::new(
+    let providers = ProviderModule::with_running_catalog(
         DestinationPolicy::default().with_loopback(coral_outbound::NetworkAccess::HttpAndHttps),
         database,
         workspaces.clone(),
@@ -255,7 +255,7 @@ pub(crate) struct Harness {
 impl Harness {
     pub(crate) async fn new() -> Self {
         let (fixture, database, workspaces) = test_foundation().await;
-        let providers = ProviderModule::new(
+        let providers = ProviderModule::with_running_catalog(
             DestinationPolicy::default().with_loopback(coral_outbound::NetworkAccess::HttpAndHttps),
             database.clone(),
             workspaces.clone(),
