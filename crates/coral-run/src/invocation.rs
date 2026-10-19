@@ -162,6 +162,8 @@ impl From<Error> for InvocationHostError {
 #[derive(Clone)]
 pub(crate) struct OperationInvoker {
     accounts: Option<coral_provider::account::AccountModule>,
+    providers: coral_provider::ProviderModule,
+    human_interface: Option<crate::HumanInterfaceUrl>,
     database: Arc<coral_db::Database>,
     workspaces: WorkspaceModule,
     actor: AuthenticatedPrincipal,
@@ -210,6 +212,8 @@ impl OperationInvoker {
     )]
     pub(crate) fn new(
         accounts: Option<coral_provider::account::AccountModule>,
+        providers: coral_provider::ProviderModule,
+        human_interface: Option<crate::HumanInterfaceUrl>,
         database: Arc<coral_db::Database>,
         workspaces: WorkspaceModule,
         actor: AuthenticatedPrincipal,
@@ -226,6 +230,8 @@ impl OperationInvoker {
     ) -> Self {
         Self {
             accounts,
+            providers,
+            human_interface,
             database,
             workspaces,
             actor,
@@ -259,12 +265,18 @@ impl OperationInvoker {
                 })
             })?;
         let (mut admitted, policy) = self.admit(call_path, arguments_json).await?;
+        // A Built-in Operation validates its input before any other work.
+        let builtin = match crate::builtin::BuiltinCall::parse(&admitted.target, &arguments) {
+            Some(Ok(call)) => Some(call),
+            Some(Err(failure)) => return Err(self.finish_failure(&admitted, failure).await?),
+            None => None,
+        };
         if policy == OperationAccessState::Disabled {
             return Err(self
                 .finish_failure(&admitted, CoralFailure::OperationDisabled)
                 .await?);
         }
-        let mut ready = match self.plan(&admitted.target, &arguments) {
+        let mut ready = match self.dispatch(&admitted, &arguments, builtin.as_ref()) {
             Ok(ready) => ready,
             Err(error) => {
                 let failure = match error {
@@ -317,7 +329,7 @@ impl OperationInvoker {
                         };
                     }
                     ready = self
-                        .plan(&admitted.target, &arguments)
+                        .dispatch(&admitted, &arguments, builtin.as_ref())
                         .map_err(Error::from)?;
                 }
             }
@@ -350,11 +362,11 @@ impl OperationInvoker {
         admitted: &AdmittedInvocation,
         fenced: FencedDispatch,
     ) -> Result<String, InvocationHostError> {
-        let outcome = match self
-            .upstream
-            .send(fenced.into_ready(), self.stop.clone())
-            .await
-        {
+        let ready = match fenced.into_ready() {
+            Dispatch::Upstream(ready) => ready,
+            Dispatch::Builtin(call) => return self.perform_builtin(admitted, &call).await,
+        };
+        let outcome = match self.upstream.send(ready, self.stop.clone()).await {
             Ok(outcome) => outcome,
             Err(UpstreamSendError::Canceled) => {
                 return Err(InvocationHostError::Fatal(Error::ProgramHostTerminated));
@@ -388,8 +400,25 @@ impl OperationInvoker {
                     .await?);
             }
         };
-        let result_json =
-            serde_json::to_string(&outcome.operation_result()).map_err(Error::ProgramValueJson)?;
+        let result_json = self
+            .finish_result(admitted, &outcome.operation_result())
+            .await?;
+        match crate::error::UpstreamRejection::of(outcome.class()) {
+            None => Ok(result_json),
+            Some(rejection) => Err(InvocationHostError::Upstream {
+                rejection,
+                outcome_json: result_json,
+            }),
+        }
+    }
+
+    /// Records a complete Operation Result as the Upstream Outcome.
+    async fn finish_result(
+        &self,
+        admitted: &AdmittedInvocation,
+        result: &serde_json::Value,
+    ) -> Result<String, InvocationHostError> {
+        let result_json = serde_json::to_string(result).map_err(Error::ProgramValueJson)?;
         if result_json.len() > self.limits.upstream_bytes()
             || self.limits.validate_json(&result_json).is_err()
         {
@@ -398,13 +427,22 @@ impl OperationInvoker {
                 .await?);
         }
         self.finish_upstream(admitted, &result_json).await?;
-        match crate::error::UpstreamRejection::of(outcome.class()) {
-            None => Ok(result_json),
-            Some(rejection) => Err(InvocationHostError::Upstream {
-                rejection,
-                outcome_json: result_json,
-            }),
+        Ok(result_json)
+    }
+
+    /// What the fence will permit: a Built-in Operation that Coral performs
+    /// itself, or one planned upstream send.
+    fn dispatch(
+        &self,
+        admitted: &AdmittedInvocation,
+        arguments: &serde_json::Value,
+        builtin: Option<&crate::builtin::BuiltinCall>,
+    ) -> Result<Dispatch, coral_upstream::Error> {
+        if let Some(call) = builtin {
+            return Ok(Dispatch::Builtin(call.clone()));
         }
+        self.plan(&admitted.target, arguments)
+            .map(Dispatch::Upstream)
     }
 
     fn plan(
@@ -676,6 +714,52 @@ impl OperationInvoker {
         }
     }
 
+    /// Performs a Built-in Operation as the invoking User and records its
+    /// Operation Result as the Upstream Outcome. Nothing is sent upstream.
+    async fn perform_builtin(
+        &self,
+        admitted: &AdmittedInvocation,
+        call: &crate::builtin::BuiltinCall,
+    ) -> Result<String, InvocationHostError> {
+        // Every runtime that runs Programs names Reef's origin; without it a
+        // built-in result could not link the person anywhere.
+        let Some(human_interface) = &self.human_interface else {
+            return Err(self
+                .finish_failure(admitted, CoralFailure::OperationUnavailable)
+                .await?);
+        };
+        let Some(user) = self.actor.authenticated_user() else {
+            return Err(self
+                .finish_failure(admitted, CoralFailure::AuthorityLost)
+                .await?);
+        };
+        let context = coral_workspace::ChangeContext::new(
+            user.clone(),
+            self.now()?,
+            coral_workspace::TraceId::current_or_new(),
+        );
+        let host = crate::builtin::BuiltinHost {
+            providers: &self.providers,
+            context: &context,
+            workspace_id: &self.workspace_id,
+            human_interface,
+        };
+        let result = tokio::select! {
+            biased;
+            () = self.stop.requested() => {
+                return Err(InvocationHostError::Fatal(Error::ProgramHostTerminated));
+            }
+            result = call.perform(&host) => result,
+        };
+        match result {
+            Ok(result) => self.finish_result(admitted, &result).await,
+            Err(Error::InvocationRejected(failure)) => {
+                Err(self.finish_failure(admitted, failure).await?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn prepare_credentials(&self, admitted: &AdmittedInvocation) -> Result<(), Error> {
         let Some(evidence) = &admitted.credential_evidence else {
             return Ok(());
@@ -825,7 +909,7 @@ impl OperationInvoker {
     async fn fence(
         &self,
         admitted: &mut AdmittedInvocation,
-        mut ready: ReadyDispatch,
+        mut ready: Dispatch,
     ) -> Result<FenceOutcome, Error> {
         let mut transaction = self.database.begin().await?;
         let Some(run) =
@@ -893,8 +977,10 @@ impl OperationInvoker {
                 }
             };
             let authorization = match &mut ready {
-                ReadyDispatch::Http(http) => http.authorize(&secret),
-                ReadyDispatch::Mcp(mcp) => mcp.authorize(&secret),
+                Dispatch::Upstream(ReadyDispatch::Http(http)) => http.authorize(&secret),
+                Dispatch::Upstream(ReadyDispatch::Mcp(mcp)) => mcp.authorize(&secret),
+                // Built-in Operations have no Credential Route.
+                Dispatch::Builtin(_) => Err(coral_upstream::Error::OperationUnavailable),
             };
             if let Err(error) = authorization {
                 return Ok(FenceOutcome::Rejected(
@@ -1182,12 +1268,19 @@ enum FenceOutcome {
     RunTerminated,
 }
 
+/// What the fence permits: one upstream send, or a Built-in Operation that
+/// Coral performs itself.
+enum Dispatch {
+    Upstream(ReadyDispatch),
+    Builtin(crate::builtin::BuiltinCall),
+}
+
 struct FencedDispatch {
-    ready: ReadyDispatch,
+    ready: Dispatch,
 }
 
 impl FencedDispatch {
-    fn into_ready(self) -> ReadyDispatch {
+    fn into_ready(self) -> Dispatch {
         self.ready
     }
 }

@@ -129,11 +129,13 @@ impl TestModules {
         let runs = RunModule::with_adapters(
             database.clone(),
             workspaces.clone(),
+            providers.clone(),
             engine,
             upstream.clone(),
             clock.clone(),
             crate::TestObservers::new(invocation_observer, execution_observer),
-        );
+        )
+        .with_human_interface(test_reef());
         Self {
             test_database: fixture,
             database,
@@ -153,9 +155,11 @@ impl TestModules {
             DestinationPolicy::default().with_loopback(coral_outbound::NetworkAccess::HttpAndHttps),
             self.database.clone(),
             self.workspaces.clone(),
+            self.providers.clone(),
             crate::IsolateLimits::default(),
         )
-        .expect("start the real Program runtime");
+        .expect("start the real Program runtime")
+        .with_human_interface(test_reef());
         match accounts {
             Some(accounts) => runs.with_accounts(accounts),
             None => runs,
@@ -985,4 +989,11 @@ pub(crate) fn change(actor: AuthenticatedUser, at: i64, trace_digit: char) -> Ch
         at,
         TraceId::parse(&trace_digit.to_string().repeat(32)).expect("trace id"),
     )
+}
+
+/// The Reef origin every test runtime links built-in results to.
+pub(crate) const TEST_REEF: &str = "https://reef.example.test";
+
+pub(crate) fn test_reef() -> crate::HumanInterfaceUrl {
+    crate::HumanInterfaceUrl::parse(TEST_REEF).expect("test Reef origin")
 }
