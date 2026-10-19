@@ -130,7 +130,7 @@ impl Renderer<'_> {
             {
                 let shown = parts
                     .iter()
-                    .filter(|part| !is_open_record(part))
+                    .filter(|part| !self.is_open_record(part, &HashSet::new()))
                     .map(|part| match part {
                         Type::Object(members) => self.members(members),
                         other => self.member(other, &mut HashSet::new()),
@@ -220,17 +220,23 @@ impl Renderer<'_> {
                 }
                 rendered.join(" | ")
             }
+            // Each part keeps its name; inline objects share one marker, and an
+            // open record adds nothing a reader can use.
             Type::Intersection(parts) => {
-                if parts.iter().any(|part| {
-                    matches!(self.shallow_body(part, &mut seen.clone()), Type::Object(_))
-                }) {
+                let mut rendered = Vec::<String>::new();
+                for part in parts {
+                    if self.is_open_record(part, seen) {
+                        continue;
+                    }
+                    let part = self.grouped(part, seen, object, opaque);
+                    if !rendered.contains(&part) {
+                        rendered.push(part);
+                    }
+                }
+                if rendered.is_empty() {
                     return object.to_string();
                 }
-                parts
-                    .iter()
-                    .map(|part| self.grouped(part, seen, object, opaque))
-                    .collect::<Vec<_>>()
-                    .join(" & ")
+                rendered.join(" & ")
             }
             Type::Array { element, readonly } => format!(
                 "{}{}[]",
@@ -282,6 +288,16 @@ impl Renderer<'_> {
         }
     }
 
+    /// Whether `type_`, through shallow aliases, is the global
+    /// `Record<string, unknown>`, which adds nothing a reader can use. A
+    /// declared `Record` alias shadows the global one.
+    fn is_open_record(&self, type_: &Type, seen: &HashSet<String>) -> bool {
+        self.alias("Record").is_none()
+            && matches!(self.shallow_body(type_, &mut seen.clone()), Type::Named { name, arguments }
+                if name == "Record"
+                    && matches!(arguments.as_slice(), [Type::Plain(key), Type::Plain(value)] if key == "string" && value == "unknown"))
+    }
+
     /// A type in operand position, in parentheses when it is a union,
     /// intersection, or function.
     fn grouped(
@@ -305,10 +321,4 @@ impl Renderer<'_> {
             rendered
         }
     }
-}
-
-fn is_open_record(type_: &Type) -> bool {
-    matches!(type_, Type::Named { name, arguments }
-        if name == "Record"
-            && matches!(arguments.as_slice(), [Type::Plain(key), Type::Plain(value)] if key == "string" && value == "unknown"))
 }

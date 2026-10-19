@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use coral_catalog::{
     CatalogDiagnostic, ExecutionBinding, HttpExecutionBinding, HttpParameterLocation,
     HttpParameterStyle, HttpResponseStatus, MaterializationOutcome, MaterializedOperation,
-    OpenApiDocument, OperationAvailability, ProviderSetupInput, materialize,
+    OpenApiDocument, OperationAvailability, ProviderSetupInput, SuccessSelection, materialize,
 };
 use coral_v8::{DiagnosticCategory, ProgramCompiler};
 use serde_json::Value;
@@ -158,6 +158,95 @@ fn http_binding(operation: &MaterializedOperation) -> &HttpExecutionBinding {
     binding
 }
 
+/// The verdict `success_for` should reach, by the declared response it names.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    ErrorStatus,
+    Undeclared,
+    Untyped,
+    Declared(HttpResponseStatus),
+}
+
+#[test]
+fn each_response_selects_one_success_verdict_and_every_success_has_a_declared_type() {
+    use HttpResponseStatus::{Code, Default, Range};
+    let prepared = ready(
+        r"
+openapi: 3.1.0
+info: { title: Selection, version: '1' }
+servers: [{ url: https://api.example.test }]
+paths:
+  /exact:
+    get:
+      operationId: exact
+      responses:
+        '200': { description: ok }
+        '404': { description: missing }
+        default: { description: error }
+  /range:
+    get:
+      operationId: range
+      responses:
+        '201': { description: created }
+        '2XX': { description: any success }
+  /default-only:
+    get:
+      operationId: defaultOnly
+      responses:
+        default: { description: any }
+  /redirect-only:
+    get:
+      operationId: redirectOnly
+      responses:
+        '302': { description: to the file }
+",
+    );
+    for (operation_id, status, redirected, expected) in [
+        ("exact", 200, false, Verdict::Declared(Code(200))),
+        // A declared error response is still an error status.
+        ("exact", 404, false, Verdict::ErrorStatus),
+        ("exact", 500, false, Verdict::ErrorStatus),
+        // `default` beside a declared 2xx is not a success.
+        ("exact", 201, false, Verdict::Undeclared),
+        ("exact", 201, true, Verdict::Undeclared),
+        // An exact code wins over the range that also covers it.
+        ("range", 201, false, Verdict::Declared(Code(201))),
+        ("range", 204, false, Verdict::Declared(Range(2))),
+        ("defaultOnly", 200, false, Verdict::Declared(Default)),
+        ("defaultOnly", 400, false, Verdict::ErrorStatus),
+        ("redirectOnly", 200, true, Verdict::Untyped),
+        ("redirectOnly", 200, false, Verdict::Undeclared),
+        ("redirectOnly", 302, false, Verdict::ErrorStatus),
+    ] {
+        let operation = prepared
+            .operations()
+            .iter()
+            .find(|operation| operation.key().as_str() == operation_id)
+            .expect("declared Operation");
+        let binding = http_binding(operation);
+        let verdict = match binding.success_for(status, redirected) {
+            SuccessSelection::ErrorStatus => Verdict::ErrorStatus,
+            SuccessSelection::Undeclared => Verdict::Undeclared,
+            SuccessSelection::Untyped => Verdict::Untyped,
+            SuccessSelection::Declared(response) => Verdict::Declared(response.status()),
+        };
+        let case = format!("{operation_id} {status} redirected={redirected}");
+        assert_eq!(verdict, expected, "{case}");
+        // The declaration types every success the runtime returns.
+        let declaration = prepared.authoring_declaration(operation);
+        let typed = match verdict {
+            Verdict::Declared(Code(code)) => format!(", {code}, "),
+            Verdict::Declared(Range(_)) => ", HttpStatus2xx, ".to_string(),
+            Verdict::Declared(Default) | Verdict::Untyped => ", number, ".to_string(),
+            Verdict::ErrorStatus | Verdict::Undeclared => continue,
+        };
+        assert!(
+            declaration.contains(&typed),
+            "{case}: no `{typed}` in\n{declaration}"
+        );
+    }
+}
+
 #[test]
 fn corpus_slice_materializes_schema_authority_and_typed_http_bindings() {
     let prepared = ready(HTTP_CORPUS_SLICE);
@@ -282,7 +371,7 @@ fn reserved_openapi_header_parameters_do_not_become_caller_arguments() {
 }
 
 #[test]
-fn http_declarations_preserve_response_alternatives_and_unknown_fallback() {
+fn http_declarations_list_only_declared_successes() {
     let prepared = ready(HTTP_CORPUS_SLICE);
     let list = prepared
         .operations()
@@ -291,102 +380,178 @@ fn http_declarations_preserve_response_alternatives_and_unknown_fallback() {
         .expect("list Operation");
     let declaration = prepared.authoring_declaration(list);
 
-    assert!(declaration.contains("HttpResult<Array<Issue>, 200, \"application/json\">"));
-    assert!(declaration.contains(", 422, \"application/problem+json\">"));
-    assert!(declaration.contains("| HttpUnknownResult>;"));
+    assert!(declaration.contains("Promise<HttpResult<Array<Issue>, 200, \"application/json\">>;"));
+    // A declared error response rejects the call, so it is not a result.
+    assert!(!declaration.contains(", 422,"), "{declaration}");
     assert_strict_compiling_declaration(&declaration);
 }
 
-/// The HTTP result metadata as each union branch repeated it before the
-/// wrapper was declared once per declaration.
-const PREVIOUS_HTTP_METADATA: &str = "{ readonly kind: \"http\"; readonly status: number; readonly headers: readonly (readonly [string, string])[]; readonly mediaType: string | null; readonly charset: string | null; readonly finalUrl: string; readonly redirects: readonly { readonly status: number; readonly url: string; readonly crossOrigin: boolean }[]; readonly decodeDiagnostics: readonly { readonly code: string; readonly message: string }[] }";
-
-/// One union branch in its previous form: the full metadata, narrowed.
-fn previous_branch(data: &str, narrowing: &str) -> String {
-    format!("{{ data: {data}; metadata: {PREVIOUS_HTTP_METADATA} & {{ {narrowing} }} }}")
-}
-
-/// A declared, decoded response in its previous form.
-fn previous_typed(data: &str, status: &str, media_type: Option<&str>) -> String {
-    let media_type = media_type.map_or_else(String::new, |media_type| {
-        format!("readonly mediaType: {media_type}; ")
-    });
-    previous_branch(
-        data,
-        &format!("readonly status: {status}; {media_type}readonly decodeDiagnostics: readonly []"),
-    )
+/// Strict TypeScript error codes for `body`, an async Program body that calls
+/// the Operation as `Materialized.callable`.
+fn strict_program_errors(declaration: &str, body: &str) -> Vec<u32> {
+    let declaration = named_callable(declaration, "callable");
+    let source = format!(
+        "declare namespace Materialized {{\n{declaration}\n}}\nexport default async function check(): Promise<void> {{\n{body}\n}}"
+    );
+    let compilation = ProgramCompiler::new(coral_v8::IsolateLimits::default())
+        .expect("pinned TypeScript compiler")
+        .prepare_saved_function(
+            std::time::Instant::now() + coral_v8::COMPILATION_TIMEOUT,
+            &source,
+        )
+        .expect("valid TypeScript");
+    compilation
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic.category() == DiagnosticCategory::Error)
+        .map(|diagnostic| u32::try_from(diagnostic.code()).expect("TypeScript code"))
+        .collect()
 }
 
 #[test]
-fn http_result_declarations_are_mutually_assignable_with_their_previous_form() {
-    let json = |schema: Value| serde_json::json!({"application/json": {"schema": schema}});
-    let reference =
-        |name: &str| serde_json::json!({"$ref": format!("#/components/schemas/{name}")});
-    let application_json = Some("\"application/json\"");
-    let cases = [
-        (
-            "getBranch",
-            serde_json::json!({
-                "200": {"description": "ok", "content": json(reference("Branch"))},
-                "301": {"description": "moved", "content": json(reference("BasicError"))},
-                "404": {"description": "missing", "content": json(reference("BasicError"))}
-            }),
-            vec![
-                previous_typed("BasicError", "301", application_json),
-                previous_typed("BasicError", "404", application_json),
-                previous_typed("Branch", "200", application_json),
-            ],
-        ),
-        (
-            "getWithDefault",
-            serde_json::json!({
-                "200": {"description": "ok", "content": json(reference("Branch"))},
-                "default": {"description": "error", "content": json(reference("BasicError"))}
-            }),
-            vec![
-                previous_typed("BasicError", "number", application_json),
-                previous_typed("Branch", "200", application_json),
-            ],
-        ),
-        (
-            "readText",
-            serde_json::json!({"200": {"description": "ok",
-                "content": {"text/*": {"schema": {"type": "string"}}}}}),
-            vec![previous_typed("string", "200", Some("string"))],
-        ),
-        (
-            "deleteBranch",
-            serde_json::json!({"204": {"description": "deleted"}}),
-            vec![previous_typed("null", "204", None)],
-        ),
-    ];
-    let paths = cases
-        .iter()
-        .map(|(operation_id, responses, _)| {
-            (
-                format!("/{operation_id}"),
-                serde_json::json!({"get": {"operationId": operation_id, "responses": responses}}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let document = serde_json::json!({
-        "openapi": "3.1.0",
-        "info": {"title": "HTTP results", "version": "1"},
-        "servers": [{"url": "https://api.example.test"}],
-        "paths": paths,
-        "components": {"schemas": {
-            "Branch": {"type": "object", "required": ["name"],
-                "properties": {"name": {"type": "string"}}},
-            "BasicError": {"type": "object", "properties": {"message": {"type": "string"}}}
-        }}
-    });
-    let prepared = ready(&document.to_string());
-    let unknown = previous_branch(
-        "unknown",
-        "readonly decodeDiagnostics: readonly [{ readonly code: string; readonly message: string }, ...{ readonly code: string; readonly message: string }[]]",
+#[expect(
+    clippy::too_many_lines,
+    reason = "one document and table cover every declared success shape"
+)]
+fn programs_read_declared_successes_without_casts_and_misspelled_fields_fail() {
+    let prepared = ready(
+        r"
+openapi: 3.1.0
+info: { title: Typed results, version: '1' }
+servers: [{ url: https://api.example.test }]
+paths:
+  /repo:
+    get:
+      operationId: getRepo
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [full_name, stargazers_count]
+                properties:
+                  full_name: { type: string }
+                  stargazers_count: { type: integer }
+                  topics: { type: array, items: { type: string } }
+        '404':
+          description: missing
+          content:
+            application/json:
+              schema: { type: object, properties: { message: { type: string } } }
+  /file:
+    put:
+      operationId: writeFile
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema: { type: object, required: [sha], properties: { sha: { type: string } } }
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { type: object, required: [id], properties: { id: { type: string } } }
+  /archive:
+    get:
+      operationId: downloadArchive
+      responses:
+        '302': { description: to the file }
+  /untyped:
+    get:
+      operationId: getUntyped
+      responses:
+        '200': { description: ok }
+  /thing:
+    delete:
+      operationId: deleteThing
+      responses:
+        '204': { description: deleted }
+  /reset:
+    post:
+      operationId: resetView
+      responses:
+        '205': { description: reset }
+  /with-default:
+    get:
+      operationId: withDefault
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: object, required: [id], properties: { id: { type: string } } }
+        default:
+          description: error
+          content:
+            application/json:
+              schema: { type: object, properties: { message: { type: string } } }
+  /default-only:
+    get:
+      operationId: defaultOnly
+      responses:
+        default:
+          description: any
+          content:
+            application/json:
+              schema: { type: object, required: [id], properties: { id: { type: string } } }
+  /free-form:
+    get:
+      operationId: freeForm
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: object }
+",
     );
-
-    for (operation_id, _, typed) in cases {
+    let call = "const r = await Materialized.callable();";
+    for (operation_id, body, errors) in [
+        (
+            "getRepo",
+            "const { status, data } = await Materialized.callable(); \
+             const name: string = data.full_name; const stars: number = data.stargazers_count; \
+             const topics: string[] | undefined = data.topics; const ok: 200 = status;",
+            vec![],
+        ),
+        // Did you mean `stargazers_count`?
+        ("getRepo", "r.data.stargazer_count;", vec![2551]),
+        // A declared 404 is thrown, so it is not a result.
+        ("getRepo", "if (r.status === 404) {}", vec![2367]),
+        ("getRepo", "r.metadata.status;", vec![2339]),
+        (
+            "writeFile",
+            "if (r.status === 201) { const id: string = r.data.id; } \
+             else { const sha: string = r.data.sha; }",
+            vec![],
+        ),
+        (
+            "downloadArchive",
+            "const data: unknown = r.data; const status: number = r.status;",
+            vec![],
+        ),
+        // A success that declares no content has untyped data.
+        ("getUntyped", "r.data.anything;", vec![18046]),
+        ("deleteThing", "const nothing: null = r.data;", vec![]),
+        // A 205 can still carry a body the runtime passes through.
+        ("resetView", "r.data.anything;", vec![18046]),
+        // `default` beside a declared 2xx is thrown.
+        ("withDefault", "if (r.status === 500) {}", vec![2367]),
+        (
+            "defaultOnly",
+            "const status: number = r.status; const id: string = r.data.id;",
+            vec![],
+        ),
+        // A free-form object stays an open map.
+        (
+            "freeForm",
+            "const value: unknown = r.data.anything;",
+            vec![],
+        ),
+    ] {
         let declaration = prepared.authoring_declaration(
             prepared
                 .operations()
@@ -394,29 +559,21 @@ fn http_result_declarations_are_mutually_assignable_with_their_previous_form() {
                 .find(|operation| operation.key().as_str() == operation_id)
                 .expect("declared Operation"),
         );
-        assert!(
-            !declaration.contains(" & { readonly status"),
-            "no branch repeats the wrapper: {declaration}"
+        let body = if body.starts_with("const {") {
+            body.to_string()
+        } else {
+            format!("{call} {body}")
+        };
+        assert_eq!(
+            strict_program_errors(&declaration, &body),
+            errors,
+            "{operation_id}: {body}\n{declaration}"
         );
-        let previous = typed
-            .iter()
-            .chain([&unknown])
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        assert_strict_compiling_declaration(&format!(
-            "{declaration}\n\
-             type Previous = {previous};\n\
-             type Current = Awaited<ReturnType<typeof callable>>;\n\
-             type Assignable<From extends To, To> = From;\n\
-             type PreviousIsCurrent = Assignable<Previous, Current>;\n\
-             type CurrentIsPrevious = Assignable<Current, Previous>;"
-        ));
     }
 }
 
 #[test]
-fn status_ranges_project_as_one_named_type_per_range() {
+fn a_success_range_projects_as_one_named_type() {
     let document = r"
 openapi: 3.1.0
 info: { title: Range status, version: '1' }
@@ -452,24 +609,16 @@ paths:
     };
     let probe = declaration("probe");
 
-    for range in ["2xx", "4xx", "5xx"] {
-        let alias = format!(
-            "type HttpStatus{range} = number & {{ readonly [HttpStatusRangeBrand]: \"{range}\" }};"
-        );
-        assert_eq!(
-            probe.lines().filter(|line| *line == alias).count(),
-            1,
-            "`{alias}` is declared once in:\n{probe}"
-        );
-    }
-    for branch in [
-        "HttpResult<({} & Record<string, unknown>), HttpStatus4xx, \"application/json\">",
-        "HttpResult<null, HttpStatus2xx, string | null>",
-        "HttpResult<null, HttpStatus5xx, string | null>",
-        "HttpResult<null, number, string | null>",
-    ] {
-        assert!(probe.contains(branch), "missing `{branch}` in:\n{probe}");
-    }
+    let alias = r#"type HttpStatus2xx = number & { readonly [HttpStatusRangeBrand]: "2xx" };"#;
+    assert_eq!(
+        probe.lines().filter(|line| *line == alias).count(),
+        1,
+        "`{alias}` is declared once in:\n{probe}"
+    );
+    assert!(
+        probe.ends_with("Promise<HttpResult<unknown, HttpStatus2xx, string | null>>;"),
+        "only the success range is a result:\n{probe}"
+    );
     assert_eq!(
         probe
             .lines()
@@ -478,12 +627,6 @@ paths:
         1,
         "the brand is declared once in:\n{probe}"
     );
-    for absent in ["HttpStatus1xx", "HttpStatus3xx", "418"] {
-        assert!(
-            !probe.contains(absent),
-            "unexpected `{absent}` in:\n{probe}"
-        );
-    }
     assert!(
         !declaration("exact").contains("HttpStatus"),
         "an Operation without ranges declares none"
@@ -491,10 +634,9 @@ paths:
     assert_strict_compiling_declaration(&format!(
         "{probe}\n\
          type Holds<Claim extends true> = Claim;\n\
-         type Statuses = Awaited<ReturnType<typeof callable>>[\"metadata\"][\"status\"];\n\
-         type RangeIsNotDefault = Holds<number extends HttpStatus4xx ? false : true>;\n\
-         type RangesAreDistinct = Holds<HttpStatus4xx extends HttpStatus5xx ? false : true>;\n\
-         type StatusIsANumber = Holds<Statuses extends number ? true : false>;"
+         type Status = Awaited<ReturnType<typeof callable>>[\"status\"];\n\
+         type RangeIsNotAnyNumber = Holds<number extends Status ? false : true>;\n\
+         type StatusIsANumber = Holds<Status extends number ? true : false>;"
     ));
 }
 
@@ -755,7 +897,7 @@ paths:
     assert!(
         prepared
             .authoring_declaration(operation)
-            .contains("data: unknown")
+            .contains("Promise<HttpResult<unknown, 200, \"application/json\">>")
     );
     assert!(
         operation
@@ -929,14 +1071,14 @@ components:
         assert_strict_compiling_declaration(&declaration);
         assert!(
             declaration.contains(
-                r#"type Attachment = ({ "content"?: BinaryValue; "owner"?: User; "size"?: number }"#
+                r#"type Attachment = { "content"?: BinaryValue; "owner"?: User; "size"?: number };"#
             ),
             "{}: {declaration}",
             operation.key().as_str()
         );
         // `User` is reached only through `Attachment`.
         assert!(
-            !own.contains("User") && declaration.contains(r#"type User = ({ "name"?: string }"#),
+            !own.contains("User") && declaration.contains(r#"type User = { "name"?: string };"#),
             "{}: {declaration}",
             operation.key().as_str()
         );
@@ -1698,9 +1840,9 @@ components:
     let operation = prepared.operations().first().expect("Operation");
     assert_eq!(operation.availability(), OperationAvailability::Available);
     assert!(
-        prepared.authoring_declaration(operation).contains(
-            r#"type Probe = ({ "id": string; "name": string } & Record<string, unknown>);"#
-        )
+        prepared
+            .authoring_declaration(operation)
+            .contains(r#"type Probe = { "id": string; "name": string };"#)
     );
     let graph = prepared.schema_graph();
     let probe = graph
@@ -2342,11 +2484,7 @@ fn composed_reference_cycles_widen_to_strict_compiling_types() {
     let declaration = prepared.authoring_declaration(operation);
     let aliases = declaration
         .lines()
-        .filter(|line| {
-            line.starts_with("type ")
-                && !line.starts_with("type HttpResult<")
-                && !line.starts_with("type HttpUnknownResult ")
-        })
+        .filter(|line| line.starts_with("type ") && !line.starts_with("type HttpResult<"))
         .collect::<Vec<_>>();
     assert!(!aliases.is_empty());
     assert!(
@@ -3426,9 +3564,7 @@ fn operation_ids_must_be_keys_and_keyword_paths_declare_valid_typescript() {
     let declaration = keyword.authoring_declaration(operation);
     assert_eq!(
         declaration.lines().last(),
-        Some(
-            "export default function (): Promise<HttpResult<null, 200, string | null> | HttpUnknownResult>;"
-        )
+        Some("export default function (): Promise<HttpResult<unknown, 200, string | null>>;")
     );
     assert_strict_compiling_declaration(&declaration);
 }
@@ -3443,14 +3579,8 @@ fn response_schema_drives_the_typescript_declaration() {
     );
     let prepared = configured_ready(&document);
     let declaration = prepared.authoring_declaration(&prepared.operations()[0]);
-    assert!(
-        declaration.starts_with(
-            "type Forecast = ({ \"temperature\": number } & Record<string, unknown>);\n"
-        )
-    );
-    assert!(declaration.ends_with(
-        "Promise<HttpResult<Forecast, 200, \"application/json\"> | HttpUnknownResult>;"
-    ));
+    assert!(declaration.starts_with("type Forecast = { \"temperature\": number };\n"));
+    assert!(declaration.ends_with("Promise<HttpResult<Forecast, 200, \"application/json\">>;"));
 }
 
 #[test]
@@ -3752,7 +3882,7 @@ fn declarations_of_every_operation_compile_together_in_one_scope() {
             "/items/id": {"get": {
                 "operationId": "byLiteral",
                 "parameters": query("literal"),
-                "responses": {"200": {"description": "ok"}, "4XX": {"description": "error"}}
+                "responses": {"2XX": {"description": "ok"}}
             }},
             "/settings": {"put": {
                 "operationId": "putSettings",
@@ -3767,9 +3897,8 @@ fn declarations_of_every_operation_compile_together_in_one_scope() {
                 "responses": ok_with(serde_json::json!({
                     "anyOf": [
                         reference("HttpResult"),
-                        reference("HttpUnknownResult"),
                         reference("BinaryValue"),
-                        reference("HttpStatus4xx")
+                        reference("HttpStatus2xx")
                     ]
                 }))
             }}
@@ -3780,9 +3909,8 @@ fn declarations_of_every_operation_compile_together_in_one_scope() {
             "Settings": {"const": "settings"},
             "SettingsInput": {"const": "component named SettingsInput"},
             "HttpResult": {"const": "component named HttpResult"},
-            "HttpUnknownResult": {"const": "component named HttpUnknownResult"},
             "BinaryValue": {"const": "component named BinaryValue"},
-            "HttpStatus4xx": {"const": "component named HttpStatus4xx"}
+            "HttpStatus2xx": {"const": "component named HttpStatus2xx"}
         }}
     });
     let prepared = ready(&document.to_string());
@@ -3803,10 +3931,9 @@ fn declarations_of_every_operation_compile_together_in_one_scope() {
         r#"type SettingsInput = "component named SettingsInput";"#,
         r#"type SettingsInput2 = "settings";"#,
         r#"type HttpResult2 = "component named HttpResult";"#,
-        r#"type HttpUnknownResult2 = "component named HttpUnknownResult";"#,
         r#"type BinaryValue2 = "component named BinaryValue";"#,
-        r#"type HttpStatus4xx2 = "component named HttpStatus4xx";"#,
-        r#"type HttpStatus4xx = number & { readonly [HttpStatusRangeBrand]: "4xx" };"#,
+        r#"type HttpStatus2xx2 = "component named HttpStatus2xx";"#,
+        r#"type HttpStatus2xx = number & { readonly [HttpStatusRangeBrand]: "2xx" };"#,
     ] {
         assert!(
             scope.lines().any(|line| line == expected),

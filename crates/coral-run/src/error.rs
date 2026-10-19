@@ -126,6 +126,48 @@ impl CoralFailure {
     }
 }
 
+/// Why a complete upstream outcome rejects its Operation call. The upstream
+/// answered, so no code here is a [`CoralFailure`] code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamRejection {
+    /// A non-2xx HTTP status, or an MCP tool result with `isError: true`.
+    Error,
+    /// A 2xx status or media type that the Operation does not declare as a success.
+    Undeclared,
+    /// A body Coral could not decode.
+    Undecodable,
+}
+
+impl UpstreamRejection {
+    /// The rejection for an outcome of `class`, or `None` for a declared success.
+    pub(crate) const fn of(class: coral_upstream::OutcomeClass) -> Option<Self> {
+        match class {
+            coral_upstream::OutcomeClass::Success => None,
+            coral_upstream::OutcomeClass::ErrorResponse => Some(Self::Error),
+            coral_upstream::OutcomeClass::UndeclaredResponse => Some(Self::Undeclared),
+            coral_upstream::OutcomeClass::UndecodableResponse => Some(Self::Undecodable),
+        }
+    }
+
+    /// Stable, transport-neutral code.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Error => "error_response",
+            Self::Undeclared => "undeclared_response",
+            Self::Undecodable => "undecodable_response",
+        }
+    }
+
+    /// Safe message without upstream content.
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Error => "The upstream service returned an error",
+            Self::Undeclared => "The upstream response is not a success this Operation declares",
+            Self::Undecodable => "The upstream response body could not be decoded",
+        }
+    }
+}
+
 impl std::fmt::Display for CoralFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.message())
@@ -277,5 +319,21 @@ mod tests {
             Some(CoralFailure::ResultTooLarge)
         );
         assert_eq!(CoralFailure::from_code("unknown"), None);
+    }
+
+    #[test]
+    fn upstream_rejection_codes_never_name_a_coral_failure() {
+        use coral_upstream::OutcomeClass;
+        assert_eq!(super::UpstreamRejection::of(OutcomeClass::Success), None);
+        for class in [
+            OutcomeClass::ErrorResponse,
+            OutcomeClass::UndeclaredResponse,
+            OutcomeClass::UndecodableResponse,
+        ] {
+            let code = super::UpstreamRejection::of(class)
+                .expect("rejection")
+                .code();
+            assert_eq!(CoralFailure::from_code(code), None, "{code}");
+        }
     }
 }
