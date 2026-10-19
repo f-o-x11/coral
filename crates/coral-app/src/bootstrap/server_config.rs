@@ -121,6 +121,11 @@ impl LoadedServerConfig {
         Ok(())
     }
 
+    /// Resolves the `[runtime]` section: the Program runtime limits.
+    pub(crate) fn runtime_limits(&self) -> Result<coral_run::RuntimeLimits, AppError> {
+        self.parse()?.runtime.resolve()
+    }
+
     /// Resolves the mandatory MCP listener and optional OIDC authentication.
     ///
     /// This returns validated configuration and resolved key material only. The
@@ -132,7 +137,7 @@ impl LoadedServerConfig {
         launcher: &Launcher,
     ) -> Result<ServeSettings, AppError> {
         let config = self.parse()?;
-        let isolate_limits = config.runtime.resolve()?;
+        let runtime_limits = config.runtime.resolve()?;
         let listeners = config.listeners;
         let mcp_settings = listeners.mcp;
         let mcp_oauth_client_bootstrap = config.outbound.mcp_oauth_client_bootstrap();
@@ -153,7 +158,7 @@ impl LoadedServerConfig {
             return Ok(ServeSettings {
                 outbound_policy: config.outbound.policy(defaults),
                 mcp_oauth_client_bootstrap,
-                isolate_limits,
+                runtime_limits,
                 mcp_http: mcp_settings.resolve(None)?,
                 auth_bind_addr,
                 session_auth: None,
@@ -206,7 +211,7 @@ impl LoadedServerConfig {
         Ok(ServeSettings {
             outbound_policy: config.outbound.policy(defaults),
             mcp_oauth_client_bootstrap,
-            isolate_limits,
+            runtime_limits,
             mcp_http,
             auth_bind_addr,
             human_interface,
@@ -365,6 +370,11 @@ impl CredentialSettings {
 struct RuntimeSettings {
     execution_heap_bytes: usize,
     compiler_heap_bytes: usize,
+    /// Program output a Run Owner may hold applied but not yet recorded before
+    /// Program requests wait for their chunk to commit. At least twice the
+    /// chunk bytes cap; 8 MiB by default.
+    #[serde(rename = "applied_output_cap_bytes")]
+    applied_output_cap: usize,
 }
 
 impl Default for RuntimeSettings {
@@ -373,14 +383,24 @@ impl Default for RuntimeSettings {
         Self {
             execution_heap_bytes: limits.execution_heap_bytes(),
             compiler_heap_bytes: limits.compiler_heap_bytes(),
+            applied_output_cap: coral_run::AppliedOutputCap::DEFAULT_BYTES,
         }
     }
 }
 
 impl RuntimeSettings {
-    fn resolve(self) -> Result<coral_run::IsolateLimits, AppError> {
-        coral_run::IsolateLimits::new(self.execution_heap_bytes, self.compiler_heap_bytes)
-            .map_err(|error| AppError::FailedPrecondition(format!("runtime: {error}")))
+    fn resolve(self) -> Result<coral_run::RuntimeLimits, AppError> {
+        let isolate_limits =
+            coral_run::IsolateLimits::new(self.execution_heap_bytes, self.compiler_heap_bytes)
+                .map_err(|error| AppError::FailedPrecondition(format!("runtime: {error}")))?;
+        let applied_output_cap = coral_run::AppliedOutputCap::new(self.applied_output_cap)
+            .map_err(|error| {
+                AppError::FailedPrecondition(format!("runtime.applied_output_cap_bytes: {error}"))
+            })?;
+        Ok(coral_run::RuntimeLimits::new(
+            isolate_limits,
+            applied_output_cap,
+        ))
     }
 }
 
@@ -533,7 +553,7 @@ impl McpHttpServeConfig {
 pub struct ServeSettings {
     outbound_policy: coral_outbound::DestinationPolicy,
     mcp_oauth_client_bootstrap: coral_provider::account::ClientBootstrapPolicy,
-    isolate_limits: coral_run::IsolateLimits,
+    runtime_limits: coral_run::RuntimeLimits,
     pub(super) mcp_http: McpHttpServeConfig,
     auth_bind_addr: SocketAddr,
     pub(super) session_auth: Option<SessionAuthSettings>,
@@ -559,10 +579,10 @@ impl ServeSettings {
         self.mcp_oauth_client_bootstrap
     }
 
-    /// Returns the per-isolate heap budgets selected at process bootstrap.
+    /// Returns the Program runtime limits selected at process bootstrap.
     #[must_use]
-    pub fn isolate_limits(&self) -> coral_run::IsolateLimits {
-        self.isolate_limits
+    pub fn runtime_limits(&self) -> coral_run::RuntimeLimits {
+        self.runtime_limits
     }
 
     /// Returns the mandatory MCP HTTP listener configuration.

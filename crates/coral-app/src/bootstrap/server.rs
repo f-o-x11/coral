@@ -321,6 +321,7 @@ impl PreparedServerBuilder {
                 .map(Box::new),
         };
         let policy = deployment_config.outbound_policy(builder.outbound_defaults)?;
+        let runtime_limits = deployment_config.runtime_limits()?;
         let config = builder.config;
         let vault = open_credential_vault(&deployment_config, state.credential_key_path())?;
         let (coral_db, state_lock) = state.into_parts();
@@ -368,6 +369,7 @@ impl PreparedServerBuilder {
             client_id_metadata_document,
             client_bootstrap_policy,
             policy,
+            runtime_limits,
             reconcile_interval,
             state_lock,
         )
@@ -473,6 +475,7 @@ fn resolve_database_config(
 pub struct RunningServer {
     providers: coral_provider::ProviderModule,
     accounts: Option<coral_provider::account::AccountModule>,
+    runs: coral_run::RunModule,
     device_recovery: Option<JoinHandle<()>>,
     search_index: coral_search::SearchIndex,
     search_reconcile: JoinHandle<()>,
@@ -609,6 +612,14 @@ impl RunningServer {
         self.search_index.clone()
     }
 
+    /// Shares the process's one Run module with companion runtime composition,
+    /// so a cancel or decision from any surface reaches the Run Owner that
+    /// another surface's Run registered.
+    #[must_use]
+    pub fn runs(&self) -> coral_run::RunModule {
+        self.runs.clone()
+    }
+
     /// Publishes the canonical MCP origin after the companion listener binds.
     /// Bootstrap supplies the validated public origin or actual local listener address.
     /// # Panics
@@ -660,6 +671,7 @@ pub(crate) async fn start_server(
     client_id_metadata_document: Option<String>,
     client_bootstrap_policy: coral_provider::account::ClientBootstrapPolicy,
     policy: coral_outbound::DestinationPolicy,
+    runtime_limits: coral_run::RuntimeLimits,
     reconcile_interval: std::time::Duration,
     state_lock: StateLock,
 ) -> Result<RunningServer, AppError> {
@@ -717,7 +729,7 @@ pub(crate) async fn start_server(
         database.clone(),
         workspaces.clone(),
         providers.clone(),
-        coral_run::IsolateLimits::default(),
+        runtime_limits,
     )
     .map_err(|error| AppError::FailedPrecondition(error.to_string()))?
     .with_provider_publisher(Arc::new(provider_workflow.clone()));
@@ -757,7 +769,7 @@ pub(crate) async fn start_server(
             tasks,
             saved_functions,
             saved_function_deletion,
-            runs,
+            runs: runs.clone(),
         },
         coral_grpc::TransportContext {
             authentication,
@@ -800,6 +812,7 @@ pub(crate) async fn start_server(
         search_index,
         search_reconcile,
         accounts,
+        runs,
         mcp_origin,
         endpoint_uri,
         local_addr,

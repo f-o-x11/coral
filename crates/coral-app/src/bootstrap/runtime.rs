@@ -18,6 +18,8 @@ use coral_workspace::WorkspaceModule;
 use super::error::AppError;
 use super::health::EngineReadiness as ListenerReadiness;
 use super::server::{PreparedServerBuilder, RunningServer as GrpcServer, ServerBuilder};
+use coral_run::RuntimeLimits;
+
 use super::server_config::{LOCAL_OUTBOUND_DEFAULTS, McpHttpServeConfig};
 use crate::auth::{AuthServerError, CoralAuthorizationServer, RunningCoralAuthorizationServer};
 
@@ -338,8 +340,7 @@ async fn start_inner(builder: PreparedServerBuilder) -> Result<RunningRuntime, S
         mcp_config,
         &grpc,
         authentication,
-        settings.isolate_limits(),
-        settings.outbound_policy(),
+        settings.runtime_limits(),
         settings.human_interface().clone(),
     )
     .await
@@ -413,18 +414,15 @@ async fn start_mcp_http(
     settings: McpHttpServeConfig,
     grpc: &GrpcServer,
     authentication: Option<crate::WorkspaceAuthentication>,
-    isolate_limits: coral_run::IsolateLimits,
-    policy: coral_outbound::DestinationPolicy,
+    runtime_limits: RuntimeLimits,
     human_interface: coral_mcp::HumanInterfaceUrl,
 ) -> Result<RunningMcpHttpServer, McpStartError> {
     let readiness = ListenerReadiness::from_database(grpc.database()).probe();
     let modules = mcp_modules(
-        policy,
         grpc.database(),
-        grpc.providers(),
-        grpc.provider_accounts(),
         grpc.search_index(),
-        isolate_limits,
+        grpc.runs(),
+        runtime_limits,
         human_interface,
     )
     .map_err(McpStartError::Runtime)?;
@@ -452,40 +450,22 @@ async fn start_mcp_http(
 }
 
 /// Composes MCP domain Modules without selecting authentication or Principal.
-/// `search_index` is the running server's, so the process has one index.
+/// `search_index` and `runs` are the running server's, so the process has one
+/// index and one set of Run Owners that every surface reaches.
 fn mcp_modules(
-    policy: coral_outbound::DestinationPolicy,
     database: Arc<Database>,
-    providers: coral_provider::ProviderModule,
-    accounts: Option<coral_provider::account::AccountModule>,
     search_index: SearchIndex,
-    isolate_limits: coral_run::IsolateLimits,
+    runs: RunModule,
+    runtime_limits: RuntimeLimits,
     human_interface: coral_mcp::HumanInterfaceUrl,
 ) -> Result<McpModules, coral_run::Error> {
     let workspaces = WorkspaceModule::new(Arc::clone(&database));
     let tasks = TaskModule::new(Arc::clone(&database), workspaces.clone());
     let search = UniversalSearchModule::new(Arc::clone(&database), workspaces.clone());
     let saved_functions =
-        SavedFunctionModule::new(Arc::clone(&database), workspaces.clone(), isolate_limits)?;
-    // createProvider publishes through the workflow Reef uses, Universal Search included.
-    let provider_workflow = coral_administration::ProviderWorkflow::new(
-        Arc::clone(&database),
-        providers.clone(),
-        search_index.clone(),
-    );
-    let runs = RunModule::new(
-        policy,
-        database,
-        workspaces.clone(),
-        providers,
-        isolate_limits,
-    )?
-    .with_provider_publisher(Arc::new(provider_workflow))
-    .with_human_interface(human_interface.clone());
-    let runs = match accounts {
-        Some(accounts) => runs.with_accounts(accounts),
-        None => runs,
-    };
+        SavedFunctionModule::new(database, workspaces.clone(), runtime_limits.isolate())?;
+    // MCP-started Runs link people to Reef; this clone shares the server's Run Owners.
+    let runs = runs.with_human_interface(human_interface.clone());
     let commands = TaskCommands::new(
         tasks.clone(),
         saved_functions,

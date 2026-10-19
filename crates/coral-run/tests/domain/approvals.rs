@@ -824,9 +824,7 @@ async fn expired_approval_cannot_be_approved_and_settles_with_a_safe_failure() {
     .unwrap();
     // Advance the decision clock to the Request deadline, not the later Run deadline.
     // The worker remains alive on its own clock so this tests expiry, not lost claims.
-    let approvals = approvals.with_clock(Arc::new(TestClock {
-        next: AtomicI64::new(approval_deadline),
-    }));
+    let approvals = approvals.with_clock(Arc::new(TestClock::starting_at(approval_deadline)));
     let stale = approvals
         .get(&operation.principal, &operation.workspace_id, &request.id)
         .await
@@ -1276,7 +1274,7 @@ async fn approval_does_not_bypass_a_later_restrictive_policy_at_the_fence() {
         )
         .await
         .unwrap();
-    wait_until(|| gate.entered.load(Ordering::SeqCst)).await;
+    wait_until(|| gate.entered()).await;
     fixture
         .policies
         .set_access_state(
@@ -1413,9 +1411,11 @@ async fn approval_event_failure_rolls_back_decision_and_invocation_settlement() 
             pending
         );
     }
-    let expired_clock = approvals.clone().with_clock(Arc::new(TestClock {
-        next: AtomicI64::new(pending.deadline_at_unix_nanos),
-    }));
+    let expired_clock = approvals
+        .clone()
+        .with_clock(Arc::new(TestClock::starting_at(
+            pending.deadline_at_unix_nanos,
+        )));
     assert!(matches!(
         expired_clock
             .decide(
@@ -1566,7 +1566,7 @@ async fn an_approval_that_expires_before_dispatch_cannot_dispatch() {
             )
             .await
             .unwrap();
-        wait_until(|| gate.entered.load(Ordering::SeqCst)).await;
+        wait_until(|| gate.entered()).await;
         // Isolate approval expiry from the longer Run and worker-claim deadlines.
         let deadline = if during_final_checks {
             APPROVAL_DEADLINE
@@ -1643,7 +1643,7 @@ async fn stale_decline_cannot_replace_a_detected_policy_failure_before_worker_co
         )
         .await
         .unwrap();
-    wait_until(|| gate.entered.load(Ordering::SeqCst)).await;
+    wait_until(|| gate.entered()).await;
     approvals
         .decide(
             &operation.principal,
@@ -1709,7 +1709,7 @@ async fn first_durable_decision_wins_against_policy_changes_before_the_worker_ob
         fixture.require_approval(&operation).await;
         let approvals = fixture.approvals();
         let run = fixture.runs.start(&invoker, &operation.workspace_id, submission("try { await coral.providers.weather.getForecast({}); } catch (e) { return e.code; }")).await.unwrap();
-        wait_until(|| gate.entered.load(Ordering::SeqCst)).await;
+        wait_until(|| gate.entered()).await;
         let request = wait_for_approval(
             &approvals,
             &operation.principal,

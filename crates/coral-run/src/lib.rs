@@ -4,9 +4,12 @@
 //! owns accepted source snapshots and execution. It validates exact
 //! Principal and Workspace attribution, compiles outside database write
 //! transactions, atomically accepts one complete Program package with
-//! `run.started`, claims execution at most once, and owns sequenced Run Events,
-//! durable Program Emissions and Logs, and the Run-bound Operation Invocation
-//! and dispatch-fence choreography.
+//! `run.started` and the Run's worker claim, and gives every launched Run one
+//! Run Owner (ADR 0018): the in-process actor that alone appends the Run
+//! Ledger on every path the Program takes, in chunks, and runs the Run-bound
+//! Operation Invocation and dispatch-fence choreography inside its commits. A
+//! Run accepted in a caller's transaction and never launched keeps its claim
+//! for recovery.
 //!
 //! # Interface
 //!
@@ -60,29 +63,36 @@
 //! no Run and starts no execution. The deadline begins at durable acceptance.
 //! Exact submitted and linked source, emitted JavaScript, source map, compiler
 //! provenance, limits, Run, and `run.started` evidence commit together.
-//! Execution code is always reloaded from that durable package. A leased worker
-//! claim can move only before the separately durable execution-start mark; after
-//! that mark JavaScript is never resumed or replayed. `coral.emit` and the bounded
-//! console append one sequenced Event under the current claim before returning to
-//! Program code; Emissions
-//! and Logs remain observable after a later failure. Invocation admission
-//! atomically retains its Provider target, arguments, child record, and
-//! `invocation.started`. One short
-//! final transaction holds current claim/Run, host-fed Organization authority,
-//! Workspace and Agent/Registration, Provider, policy, exact Account authorization
-//! and token-material revision, and Approval evidence. It validates
-//! the retained Provider Generation rather than requiring it to remain active.
-//! After every awaited check it resamples time and validates Run, claim,
-//! Registration, and Approval deadlines immediately before the single-use fence.
-//! Missing User caller Accounts attach to durable shared connection requests;
-//! each Invocation keeps its Run deadline and detaches on selection or terminal
-//! cleanup. Approval is requested only after Account selection and before credential
-//! resolution. Its first decision and safe lifecycle evidence commit together;
-//! decline and expiry also settle the child atomically. Waiting never replays a
-//! Program or changes its selected account. Sending holds no database
-//! transaction, and `invocation.ended` commits before the Program Promise settles.
-//! A terminal-persistence failure terminates host execution without settling the
-//! Promise, and a Run cannot complete while any child Invocation is nonterminal.
+//! Execution code is always reloaded from that durable package. Acceptance
+//! writes the Run's worker claim, so no running Run is unclaimed; the Run
+//! Owner's first chunk is the execution-start mark, and after it JavaScript is
+//! never resumed or replayed. The owner applies `coral.emit`, the bounded
+//! console, admission and Invocation results in arrival order against its
+//! exact output total and answers the Program at Applied; each chunk commits
+//! when none is in flight, predicated on the owner's claim and the head, and
+//! renews the lease. Above the Applied cap on unrecorded output the Program
+//! waits for the chunk. Emissions and Logs remain observable after a later
+//! failure. Invocation admission retains its Provider target, arguments,
+//! child record, and `invocation.started` in one chunk. The Dispatch Fence is
+//! row work inside one chunk commit: under the held Run it checks current
+//! claim/Run, host-fed Organization authority, Workspace and
+//! Agent/Registration, Provider, policy, exact Account authorization and
+//! token-material currency, and Approval evidence, validates the retained
+//! Provider Generation rather than requiring it to remain active, resamples
+//! time after every awaited check, and records the dispatch start. Decryption
+//! and the upstream send run outside every lock; a stop that reaches the
+//! owner first ends a fenced Invocation as `run_terminated` instead of
+//! sending. Missing User caller Accounts attach to durable shared connection
+//! requests; each Invocation keeps its Run deadline and detaches on selection
+//! or terminal cleanup. Approval is requested only after Account selection and
+//! before credential resolution. Its first decision and safe lifecycle
+//! evidence commit together; decline and expiry also settle the child
+//! atomically. Waiting never replays a Program or changes its selected
+//! account. An upstream result settles the Program Promise at Applied; a known
+//! failure only once it is recorded. A claim mismatch on commit stops the
+//! owner at once: it terminates the Program, cancels its dispatches, and
+//! answers waiting requests `OwnerLost`. A Run cannot complete while any child
+//! Invocation is nonterminal.
 //! Cancellation and deadline intent stop new Program work, request uncatchable V8
 //! termination, and preserve complete child outcomes that beat bounded cleanup.
 //! Recovery revokes a stale started claim before settling its children and Run.
@@ -120,6 +130,7 @@ mod invocation_lifecycle;
 mod invocation_repository;
 mod lifecycle;
 mod observation;
+mod owner;
 mod program_output;
 mod required_actions;
 mod required_actions_repository;
@@ -141,23 +152,25 @@ pub use coral_v8::{IsolateLimits, ProgramError, ProgramOperationError};
 pub use coral_value::ValueLimits;
 use engine::{Clock, ProgramEngine, SystemClock, V8ProgramEngine};
 pub use error::{CoralFailure, Error, Rejection};
-use execution::{ActiveExecutions, ExecutionPolicy};
+use execution::ExecutionPolicy;
 #[cfg(test)]
 use execution::{ExecutionObserver, NoopExecutionObserver};
 #[cfg(test)]
 use invocation::{InvocationObserver, NoopInvocationObserver};
 use invocation::{ProductionUpstream, UpstreamSender};
+use owner::Owners;
 pub use required_actions::{
     ActionCursor, ActionPage, ActionSummary, QueueCursor, QueuedAction, RequiredAction,
     RequiredActionRequest, RequiredActions, RequiredActor,
 };
 pub use types::{
-    COMBINED_TYPESCRIPT_MAX_BYTES, COMPILATION_TIMEOUT, EMITTED_JAVASCRIPT_MAX_BYTES, FinalValue,
-    InvocationId, InvocationResultKind, LINKED_SAVED_FUNCTION_MAX_COUNT,
-    PROGRAM_LOG_MESSAGE_MAX_BYTES, PROGRAM_SOURCE_MAX_BYTES, ProgramLogLevel, ProgramSource,
-    ProgramValue, RUN_EVENT_PAGE_MAX, RUN_TIMEOUT_MAX_MS, RunCursor, RunEvent, RunEventKind,
-    RunFailure, RunFailureCode, RunId, RunObservation, RunState, RunSubmission, RunTerminalOutcome,
-    RunTimeout, RunUpdate, SOURCE_MAP_MAX_BYTES,
+    AppliedOutputCap, CHUNK_BYTES_CAP, CHUNK_EVENTS_CAP, COMBINED_TYPESCRIPT_MAX_BYTES,
+    COMPILATION_TIMEOUT, EMITTED_JAVASCRIPT_MAX_BYTES, FinalValue, InvocationId,
+    InvocationResultKind, LINKED_SAVED_FUNCTION_MAX_COUNT, PROGRAM_LOG_MESSAGE_MAX_BYTES,
+    PROGRAM_SOURCE_MAX_BYTES, ProgramLogLevel, ProgramSource, ProgramValue, RUN_EVENT_PAGE_MAX,
+    RUN_TIMEOUT_MAX_MS, RunCursor, RunEvent, RunEventKind, RunFailure, RunFailureCode, RunId,
+    RunObservation, RunState, RunSubmission, RunTerminalOutcome, RunTimeout, RunUpdate,
+    RuntimeLimits, SOURCE_MAP_MAX_BYTES,
 };
 
 #[cfg(test)]
@@ -190,7 +203,8 @@ pub struct RunModule {
     clock: Arc<dyn Clock>,
     execution_policy: ExecutionPolicy,
     value_limits: coral_value::ValueLimits,
-    active_executions: ActiveExecutions,
+    applied_output_cap: AppliedOutputCap,
+    owners: Owners,
     #[cfg(test)]
     invocation_observer: Arc<dyn InvocationObserver>,
     #[cfg(test)]
@@ -198,7 +212,7 @@ pub struct RunModule {
 }
 
 impl RunModule {
-    /// Builds the runtime with deployment-selected outbound policy and isolate limits.
+    /// Builds the runtime with the deployment's outbound policy and runtime limits.
     /// Built-in Operations prepare Setups through `providers`, the bootstrap's
     /// Provider Module.
     /// # Errors
@@ -208,7 +222,7 @@ impl RunModule {
         database: Arc<Database>,
         workspaces: WorkspaceModule,
         providers: coral_provider::ProviderModule,
-        isolate_limits: IsolateLimits,
+        limits: RuntimeLimits,
     ) -> Result<Self, Error> {
         Ok(Self {
             providers,
@@ -217,12 +231,13 @@ impl RunModule {
             database,
             workspaces,
             accounts: None,
-            engine: Arc::new(V8ProgramEngine::new(isolate_limits)?),
+            engine: Arc::new(V8ProgramEngine::new(limits.isolate())?),
             upstream: Arc::new(ProductionUpstream::new(policy)?),
             clock: Arc::new(SystemClock),
             execution_policy: ExecutionPolicy::production(),
             value_limits: coral_value::ValueLimits::default(),
-            active_executions: ActiveExecutions::default(),
+            applied_output_cap: limits.applied_output_cap(),
+            owners: Owners::default(),
             #[cfg(test)]
             invocation_observer: Arc::new(NoopInvocationObserver),
             #[cfg(test)]
@@ -252,7 +267,8 @@ impl RunModule {
             clock,
             execution_policy: ExecutionPolicy::testing(),
             value_limits: coral_value::ValueLimits::default(),
-            active_executions: ActiveExecutions::default(),
+            applied_output_cap: AppliedOutputCap::default(),
+            owners: Owners::default(),
             invocation_observer: observers.invocation,
             execution_observer: observers.execution,
         }
@@ -300,6 +316,19 @@ impl RunModule {
         self.value_limits
     }
 
+    /// Replaces the Applied cap on a built module.
+    #[cfg(test)]
+    pub(crate) const fn with_applied_output_cap(mut self, cap: AppliedOutputCap) -> Self {
+        self.applied_output_cap = cap;
+        self
+    }
+
+    /// Returns the Applied cap new Run Owners decide against.
+    #[must_use]
+    pub const fn applied_output_cap(&self) -> AppliedOutputCap {
+        self.applied_output_cap
+    }
+
     async fn visibility_scope_in_transaction(
         &self,
         transaction: &mut Transaction<'_>,
@@ -331,9 +360,10 @@ impl RunModule {
         self.clock.now_unix_nanos().map_err(Error::Clock)
     }
 
+    /// Whether this process still hosts the Run's owner.
     #[cfg(test)]
-    fn has_active_execution(&self, run_id: &RunId) -> bool {
-        self.active_executions.contains(run_id)
+    fn has_owner(&self, run_id: &RunId) -> bool {
+        self.owners.contains(run_id)
     }
 
     #[cfg(test)]

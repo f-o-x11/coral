@@ -949,7 +949,7 @@ async fn recovery_settles_a_lost_publication_from_its_publication() {
             "publishes first: {publishes_first}, deleted since: {deleted_since}"
         );
         publisher.release.notify_one();
-        wait_until(|| !scope.fixture.runs.has_active_execution(&run)).await;
+        wait_until(|| !scope.fixture.runs.has_owner(&run)).await;
     }
 }
 
@@ -1566,7 +1566,7 @@ async fn the_source_fetch_uses_the_bootstrap_destination_policy() {
             scope.fixture.database.clone(),
             scope.fixture.workspaces.clone(),
         ),
-        crate::IsolateLimits::default(),
+        crate::RuntimeLimits::default(),
     )
     .expect("start the real Program runtime")
     .with_human_interface(test_reef());

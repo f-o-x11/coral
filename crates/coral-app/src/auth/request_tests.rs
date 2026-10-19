@@ -363,7 +363,7 @@ impl Fixture {
                 workspaces.clone(),
                 coral_catalog::BuiltinCatalog::running().expect("the built-in catalog prepares"),
             ),
-            coral_run::IsolateLimits::default(),
+            coral_run::RuntimeLimits::default(),
         )
         .unwrap();
         let commands = coral_task::TaskCommands::new(

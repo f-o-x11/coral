@@ -176,7 +176,7 @@ impl Fixture {
             database.clone(),
             workspaces.clone(),
             providers.clone(),
-            coral_run::IsolateLimits::default(),
+            coral_run::RuntimeLimits::default(),
         )
         .unwrap()
         .with_accounts(accounts.clone());
