@@ -97,6 +97,19 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
     let named_input = "interface Input {\n    value: number;\n    nested: {\n        a: string;\n    };\n    tags?: string[];\n}\nexport default function run(input: Input): number;\nexport {};\n";
     let anonymous =
         "export default function (input: {\n    q: string;\n}): {\n    n: number;\n};\n";
+    let inferred = "export default function pullRequestDetails(input: {\n    repo: string;\n    number: number;\n}): Promise<{\n    title: string;\n    merged_at: string | null;\n    base: {\n        ref: string;\n    };\n    linked: string[];\n}>;\n";
+    let listed = "export default function openPrs(input: {\n    repo: string;\n}): Promise<{\n    number: number;\n    author: {\n        login: string;\n    };\n}[]>;\n";
+    let generic_array = "export default function openIssuesByLabel(input: {\n    label: string;\n}): Promise<Array<{\n    number: number;\n    title: string;\n}>>;\n";
+    let readonly_array = "export default function labels(): ReadonlyArray<{ name: string }>;";
+    let named_union = "interface Row { id: number }\nexport default function find(input: { id: number }): Promise<Row | undefined>;";
+    let named_intersection = "interface Base { id: number }\nexport default function tagged(): Promise<Base & { tag: string }>;";
+    let aliased_promise =
+        "type Result = Promise<{ title: string }>;\nexport default function aliased(): Result;";
+    let union_elements = "interface Row { id: number }\nexport default function rows(): Promise<(Row | undefined)[]>;";
+    let union_generic =
+        "export default function events(): Array<{ kind: \"a\" } | { kind: \"b\" }>;";
+    let mapped_result =
+        "export default function mapped(): Promise<{ [K in \"a\" | \"b\"]: number }>;";
     let arrow = "declare const g: (input: {\n    q: string;\n}) => number;\nexport default g;\n";
     let alias_union = "type Mode = 'a' | 'b';\ntype Modes = Mode[];\ninterface Out { x: number }\nexport default function f(input: { mode: Mode; modes?: Modes; limit?: number }): Promise<Out[]>;";
     let recursive = "type Tree = Tree[] | string;\nexport default function walk(input: { tree: Tree }): number;";
@@ -123,7 +136,7 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
         (
             nested_mcp,
             Callable::Operation { leaf: "forecast" },
-            "forecast(input: { city: string; options?: {…}; days?: Array<number> }): Promise<{ data: object }>",
+            "forecast(input: { city: string; options?: {…}; days?: Array<number> }): Promise<{ data: {…} }>",
         ),
         (
             status_range.as_str(),
@@ -133,12 +146,12 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
         (
             named_with_inline.as_str(),
             Callable::Operation { leaf: "update" },
-            "update(): Promise<{ data: Issue & object }>",
+            "update(): Promise<{ data: Issue & {…} }>",
         ),
         (
             inline_only.as_str(),
             Callable::Operation { leaf: "merged" },
-            "merged(): Promise<{ data: object }>",
+            "merged(): Promise<{ data: {…} }>",
         ),
         (
             typed_and_untyped.as_str(),
@@ -183,7 +196,61 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
         (
             anonymous,
             Callable::SavedFunction { leaf: "count" },
-            "count(input: { q: string }): object",
+            "count(input: { q: string }): { n: number }",
+        ),
+        (
+            inferred,
+            Callable::SavedFunction {
+                leaf: "pullRequestDetails",
+            },
+            "pullRequestDetails(input: { repo: string; number: number }): Promise<{ title: string; merged_at: string | null; base: {…}; linked: string[] }>",
+        ),
+        (
+            listed,
+            Callable::SavedFunction { leaf: "openPrs" },
+            "openPrs(input: { repo: string }): Promise<{ number: number; author: {…} }[]>",
+        ),
+        (
+            generic_array,
+            Callable::SavedFunction {
+                leaf: "openIssuesByLabel",
+            },
+            "openIssuesByLabel(input: { label: string }): Promise<Array<{ number: number; title: string }>>",
+        ),
+        (
+            readonly_array,
+            Callable::SavedFunction { leaf: "labels" },
+            "labels(): ReadonlyArray<{ name: string }>",
+        ),
+        (
+            named_union,
+            Callable::SavedFunction { leaf: "find" },
+            "find(input: { id: number }): Promise<{ id: number } | undefined>",
+        ),
+        (
+            named_intersection,
+            Callable::SavedFunction { leaf: "tagged" },
+            "tagged(): Promise<{ id: number } & { tag: string }>",
+        ),
+        (
+            aliased_promise,
+            Callable::SavedFunction { leaf: "aliased" },
+            "aliased(): Promise<{ title: string }>",
+        ),
+        (
+            union_elements,
+            Callable::SavedFunction { leaf: "rows" },
+            "rows(): Promise<({ id: number } | undefined)[]>",
+        ),
+        (
+            union_generic,
+            Callable::SavedFunction { leaf: "events" },
+            "events(): Array<{ kind: \"a\" } | { kind: \"b\" }>",
+        ),
+        (
+            mapped_result,
+            Callable::SavedFunction { leaf: "mapped" },
+            "mapped(): Promise<…>",
         ),
         (
             arrow,
@@ -193,7 +260,7 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
         (
             alias_union,
             Callable::SavedFunction { leaf: "f" },
-            "f(input: { mode: \"a\" | \"b\"; modes?: (\"a\" | \"b\")[]; limit?: number }): Promise<Out[]>",
+            "f(input: { mode: \"a\" | \"b\"; modes?: (\"a\" | \"b\")[]; limit?: number }): Promise<{ x: number }[]>",
         ),
         (
             recursive,
