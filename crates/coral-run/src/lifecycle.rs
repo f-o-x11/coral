@@ -56,14 +56,22 @@ impl RunRecord {
             && now_unix_nanos < self.deadline_at_unix_nanos
     }
 
+    /// Whether the owner holding `claim_id` may still do Program work on
+    /// this Run. True when the Run is running, no termination is recorded,
+    /// both claim columns hold `claim_id`, and the deadline has not passed.
+    ///
+    /// The lease is deliberately not part of this check. The lease decides
+    /// which process owns the Run; every commit renews it. Inside its own
+    /// process an owner keeps working after its lease lapsed, as long as
+    /// its commits still find its claim on the row. What ends such a Run is
+    /// the owner's own liveness bound (see the Run Owner), or another
+    /// process taking the claim, which the owner then sees as a claim
+    /// mismatch.
     pub(crate) fn program_work_is_current(&self, claim_id: &str, now_unix_nanos: i64) -> bool {
         self.state == RunState::Running
             && self.termination.is_none()
             && self.execution_claim_id.as_deref() == Some(claim_id)
             && self.worker_claim_id.as_deref() == Some(claim_id)
-            && self
-                .worker_claim_expires_at_unix_nanos
-                .is_some_and(|expires_at| now_unix_nanos < expires_at)
             && now_unix_nanos < self.deadline_at_unix_nanos
     }
 

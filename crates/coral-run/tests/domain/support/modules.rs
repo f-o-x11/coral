@@ -979,13 +979,26 @@ pub(crate) async fn wait_until(predicate: impl Fn() -> bool) {
 
 /// Like [`wait_until`] for a condition that reads the database.
 pub(crate) async fn wait_until_async(predicate: impl AsyncFn() -> bool) {
-    for _ in 0..200 {
+    wait_until_async_within(Duration::from_secs(1), predicate).await;
+}
+
+/// Like [`wait_until_async`] for a condition that may take `within` of
+/// waiting to hold, such as a write the owner retries with backoff. The
+/// budget counts the waits, not the predicate's own reads.
+pub(crate) async fn wait_until_async_within(within: Duration, predicate: impl AsyncFn() -> bool) {
+    const STEP: Duration = Duration::from_millis(5);
+    let mut waited = Duration::ZERO;
+    loop {
         if predicate().await {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            waited < within,
+            "condition did not become true within {within:?} of waiting"
+        );
+        tokio::time::sleep(STEP).await;
+        waited += STEP;
     }
-    panic!("condition did not become true");
 }
 
 /// The last Event sequence of a Run read from a snapshot.

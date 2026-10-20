@@ -348,28 +348,136 @@ impl RunModule {
             .ok_or(Error::RunNotFound)
     }
 
+    /// The terminal chunk of a recorded termination: every nonterminal
+    /// Invocation ended, their `invocation.ended` Events, and `run.ended`,
+    /// in one head move.
     pub(crate) async fn finish_termination_in_transaction(
         &self,
         transaction: &mut Transaction<'_>,
         run: &RunRecord,
         terminal_at_unix_nanos: i64,
     ) -> Result<(), Error> {
-        invocation_lifecycle::end_nonterminal_for_run(transaction, run, terminal_at_unix_nanos)
-            .await?;
-        let run =
-            run_repository::find_exact_in_transaction(transaction, &run.workspace_id, &run.id)
-                .await?
-                .ok_or(Error::RunNotFound)?;
         let termination = run
             .termination
             .ok_or_else(|| Error::CorruptData("Run has no termination to finish".into()))?;
+        let events = invocation_lifecycle::end_nonterminal_invocations(
+            transaction,
+            run,
+            terminal_at_unix_nanos,
+        )
+        .await?;
         run_repository::finish_termination(
             transaction,
-            &run,
+            run,
+            &events,
             &termination.kind.outcome(),
             terminal_at_unix_nanos,
         )
         .await
+    }
+
+    /// Interrupts the Run `claim_id` owns in one chunk: the Program's pending
+    /// Invocations end `run_terminated`, dispatching ones `indeterminate`,
+    /// their Approval Requests close, and the Run ends `interrupted` (or
+    /// `timed_out` past its deadline), or with the termination an outside
+    /// writer already recorded (a cancellation wins). The self-interrupt path of a Run Owner that cannot commit, and
+    /// of the supervisor that takes over a Run whose owner task ended without
+    /// retiring; `takeover_claim_id` is the claim the supervisor mints so that
+    /// nothing still in flight under `claim_id` can land afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ClaimMismatch`] when the Run row no longer holds `claim_id`
+    /// (another writer took the Run), [`Error::RunEnded`] when the Run is
+    /// terminal already; neither writes anything. An operational error leaves
+    /// the outcome unknown, and the next attempt's hold reads which it was.
+    pub(crate) async fn interrupt_owned_run(
+        &self,
+        workspace_id: &WorkspaceId,
+        run_id: &RunId,
+        claim_id: &str,
+        takeover_claim_id: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut transaction = self.database.begin().await?;
+        let run = run_repository::hold_run(&mut transaction, workspace_id, run_id)
+            .await?
+            .ok_or(Error::ClaimMismatch)?;
+        if run.state.is_terminal() {
+            // An earlier attempt of this very interruption may have landed
+            // without an answer: the row then carries the claim it wrote and
+            // the outcome it chose.
+            let recorded_by_us = matches!(run.state, RunState::Interrupted | RunState::TimedOut)
+                && run.execution_claim_id.as_deref() == Some(takeover_claim_id.unwrap_or(claim_id));
+            return if recorded_by_us {
+                Ok(())
+            } else {
+                Err(Error::RunEnded)
+            };
+        }
+        let held_claim = run
+            .execution_claim_id
+            .as_deref()
+            .or(run.worker_claim_id.as_deref());
+        if held_claim != Some(claim_id) {
+            return Err(Error::ClaimMismatch);
+        }
+        // Never before a termination an outside writer already recorded.
+        let now = self.now()?.max(run.accepted_at_unix_nanos).max(
+            run.termination
+                .map_or(run.accepted_at_unix_nanos, |termination| {
+                    termination.started_at_unix_nanos
+                }),
+        );
+        // Past the deadline the Run timed out, as every deadline path records.
+        let termination = match run.termination {
+            Some(termination) => termination,
+            None if now >= run.deadline_at_unix_nanos => {
+                run.request_termination(RunTerminationKind::TimedOut, None, now)?
+                    .termination
+            }
+            None => {
+                run.request_termination(RunTerminationKind::Interrupted, None, now)?
+                    .termination
+            }
+        };
+        let events =
+            invocation_lifecycle::end_nonterminal_invocations(&mut transaction, &run, now).await?;
+        run_repository::interrupt_run(
+            &mut transaction,
+            &run,
+            &events,
+            &termination,
+            takeover_claim_id,
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// [`Self::interrupt_owned_run`] until it lands: the last write a Run
+    /// gets, so every answer but a claim mismatch or an ended Run is followed
+    /// by another attempt after a bounded backoff (a rejection included,
+    /// which a chunk commit would not retry), and the next hold reads whether
+    /// the previous one landed. Never ends on the clock.
+    pub(crate) async fn record_interruption(
+        &self,
+        workspace_id: &WorkspaceId,
+        run_id: &RunId,
+        claim_id: &str,
+        takeover_claim_id: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut backoff = crate::execution::Backoff::new(run_id, "interruption");
+        loop {
+            match self
+                .interrupt_owned_run(workspace_id, run_id, claim_id, takeover_claim_id)
+                .await
+            {
+                Err(fenced @ (Error::ClaimMismatch | Error::RunEnded)) => return Err(fenced),
+                Err(error) => backoff.wait(&error).await,
+                Ok(()) => return Ok(()),
+            }
+        }
     }
 }
 

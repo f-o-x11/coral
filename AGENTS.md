@@ -52,6 +52,17 @@
   that holds the Run row from a Program path. See
   [ADR 0018](docs/adr/0018-run-owner-coordinates-each-run.md) for the writers
   that still hold the row from outside the owner.
+- A Run Owner's write ends on the database's answer, never on the clock: an
+  unanswered write (`Error::is_operational`: a lost connection, a pool
+  timeout, a lock race) means a reread and a retry with bounded backoff until
+  the answer comes or the owner has retired, and a definite answer (a
+  rejection, a claim mismatch, an ended Run, a corrupt head) stops it; the
+  Interrupted record alone retries every answer but a claim mismatch or an
+  ended Run. The worker lease is ownership between processes, renewed by
+  every commit; it never ends a Run from inside its own process. The owner's
+  own bounds do (suspect after one lease without a commit, self-interrupt
+  after three, constants in `crates/coral-run/src/execution.rs`), and the
+  supervisor of a panicked owner task writes the same one Interrupted chunk.
 - Give each independently identified entity one stable ID as its sole primary
   key. Use a composite primary key only when the tuple is the domain identity.
 - For Workspace-owned data, every externally influenced read or write must

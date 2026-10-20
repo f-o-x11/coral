@@ -49,6 +49,29 @@ impl Error {
             _ => false,
         }
     }
+
+    /// Reports whether the backend gave no answer to a write: the connection
+    /// or pool failed, or a lock or serialization race left the statement
+    /// unapplied. The write may be retried; whether it took effect is for the
+    /// caller to read back. Every other error is the backend's definite
+    /// answer, a constraint violation included.
+    #[must_use]
+    pub fn is_unanswered(&self) -> bool {
+        match self {
+            Self::WriterBusy => true,
+            Self::Sqlx(error) => match error {
+                sqlx::Error::Database(_) => sqlx_error_is_serialization_conflict(error),
+                sqlx::Error::Io(_)
+                | sqlx::Error::Tls(_)
+                | sqlx::Error::Protocol(_)
+                | sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::WorkerCrashed => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 /// Reports a timed-out wait for the `SQLite` writer as [`Error::WriterBusy`].
@@ -84,7 +107,64 @@ fn is_conflict_code(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_conflict_code;
+    use super::{Error, is_conflict_code};
+
+    #[test]
+    fn an_unanswered_write_is_a_lost_connection_or_a_race_never_a_rejection() {
+        assert!(Error::WriterBusy.is_unanswered());
+        assert!(Error::Sqlx(sqlx::Error::PoolTimedOut).is_unanswered());
+        assert!(Error::Sqlx(sqlx::Error::PoolClosed).is_unanswered());
+        assert!(Error::Sqlx(sqlx::Error::WorkerCrashed).is_unanswered());
+        assert!(
+            Error::Sqlx(sqlx::Error::Io(std::io::Error::other("connection reset"))).is_unanswered()
+        );
+        assert!(!Error::Sqlx(sqlx::Error::RowNotFound).is_unanswered());
+        assert!(!Error::Sqlx(sqlx::Error::ColumnNotFound("x".into())).is_unanswered());
+        assert!(!Error::ObservationUnavailable.is_unanswered());
+        assert!(!Error::Config("bad".into()).is_unanswered());
+    }
+
+    /// A busy writer the backend reports is unanswered; a constraint it
+    /// enforces is a definite rejection.
+    #[tokio::test]
+    async fn a_busy_writer_is_unanswered_and_a_constraint_violation_is_not() {
+        use sqlx::Connection as _;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(directory.path().join("errors.sqlite"))
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::ZERO);
+        let mut first = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("first connection");
+        let mut second = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("second connection");
+        sqlx::raw_sql("CREATE TABLE rows (id INTEGER PRIMARY KEY); INSERT INTO rows VALUES (1)")
+            .execute(&mut first)
+            .await
+            .expect("arrange");
+
+        let duplicate = sqlx::raw_sql("INSERT INTO rows VALUES (1)")
+            .execute(&mut first)
+            .await
+            .expect_err("a duplicate key is rejected");
+        let duplicate = Error::Sqlx(duplicate);
+        assert!(duplicate.is_unique_violation());
+        assert!(!duplicate.is_unanswered(), "{duplicate}");
+
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut first)
+            .await
+            .expect("hold the writer");
+        let busy = sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut second)
+            .await
+            .expect_err("the second writer is busy");
+        let busy = Error::Sqlx(busy);
+        assert!(busy.is_serialization_conflict());
+        assert!(busy.is_unanswered(), "{busy}");
+    }
 
     #[test]
     fn conflict_codes_cover_both_backends() {
