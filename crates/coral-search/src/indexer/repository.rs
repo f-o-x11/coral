@@ -16,6 +16,7 @@ use sea_query::{
 };
 
 use super::IndexError;
+use super::retry::RetryRule;
 use crate::{CallPath, SearchIndexFailure, SearchIndexState};
 
 /// The `search_entities` table and its columns, for sea-query. Each row is
@@ -50,7 +51,7 @@ enum SearchEntities {
 /// The `search_index_states` table and its columns, for sea-query. Each row
 /// is the state of one indexing attempt: one per Generation attempt, one per
 /// failed Saved Function attempt.
-#[derive(Iden)]
+#[derive(Clone, Copy, Iden)]
 enum SearchIndexStates {
     Table,
     WorkspaceId,
@@ -67,6 +68,45 @@ enum SearchIndexStates {
     Error,
     /// The kind of error a failed Generation attempt recorded.
     ErrorKind,
+    /// The columns of a failed attempt's [`RetryRule`], [`RETRY_COLUMNS`].
+    FailedAttempts,
+    RetryAfterUnixNanos,
+    FailedCoralVersion,
+    /// The definition revision a failed Saved Function attempt tried.
+    FailedSavedFunctionRevision,
+}
+
+/// The columns of a failed attempt's [`RetryRule`], in [`retry_values`]
+/// order.
+const RETRY_COLUMNS: [SearchIndexStates; 3] = [
+    SearchIndexStates::FailedAttempts,
+    SearchIndexStates::RetryAfterUnixNanos,
+    SearchIndexStates::FailedCoralVersion,
+];
+
+/// `columns`, then the [`RETRY_COLUMNS`].
+fn with_retry_columns<const N: usize>(
+    columns: [SearchIndexStates; N],
+) -> impl Iterator<Item = SearchIndexStates> {
+    columns.into_iter().chain(RETRY_COLUMNS)
+}
+
+/// The [`RETRY_COLUMNS`] as a read returns them, flattened into a row.
+#[derive(sqlx::FromRow)]
+struct RetryColumns {
+    failed_attempts: Option<i64>,
+    retry_after_unix_nanos: Option<i64>,
+    failed_coral_version: Option<String>,
+}
+
+impl From<RetryColumns> for RetryRule {
+    fn from(columns: RetryColumns) -> Self {
+        Self {
+            attempts: columns.failed_attempts,
+            retry_after_unix_nanos: columns.retry_after_unix_nanos,
+            coral_version: columns.failed_coral_version,
+        }
+    }
 }
 
 /// The Postgres `search_stats` table and the columns the reconcile pass
@@ -193,6 +233,7 @@ pub(super) enum AttemptState {
     Failed {
         error: String,
         failure: Option<SearchIndexFailure>,
+        retry: RetryRule,
     },
 }
 
@@ -333,15 +374,19 @@ pub(super) async fn write_generation_state(
     transaction: &mut Transaction<'_>,
     state: GenerationState<'_>,
 ) -> Result<(), Error> {
-    let (name, error, error_kind) = match state.state {
-        AttemptState::Complete => (COMPLETE, None, None),
-        AttemptState::Failed { error, failure } => (FAILED, Some(error), failure.map(failure_kind)),
+    let (name, error, error_kind, retry) = match state.state {
+        AttemptState::Complete => (COMPLETE, None, None, None),
+        AttemptState::Failed {
+            error,
+            failure,
+            retry,
+        } => (FAILED, Some(error), failure.map(failure_kind), Some(retry)),
     };
     transaction
         .execute(
             Query::insert()
                 .into_table(SearchIndexStates::Table)
-                .columns([
+                .columns(with_retry_columns([
                     SearchIndexStates::WorkspaceId,
                     SearchIndexStates::TargetId,
                     SearchIndexStates::Kind,
@@ -352,28 +397,32 @@ pub(super) async fn write_generation_state(
                     SearchIndexStates::AttemptedAtUnixNanos,
                     SearchIndexStates::Error,
                     SearchIndexStates::ErrorKind,
-                ])
-                .values_panic([
-                    state.workspace_id.to_string().into(),
-                    state.generation_id.to_string().into(),
-                    OPERATION.into(),
-                    state.provider_id.to_string().into(),
-                    state.generation_id.to_string().into(),
-                    state.display_name.into(),
-                    name.into(),
-                    state.attempted_at_unix_nanos.into(),
-                    error.into(),
-                    error_kind.into(),
-                ])
+                ]))
+                .values_panic(
+                    [
+                        state.workspace_id.to_string().into(),
+                        state.generation_id.to_string().into(),
+                        OPERATION.into(),
+                        state.provider_id.to_string().into(),
+                        state.generation_id.to_string().into(),
+                        state.display_name.into(),
+                        name.into(),
+                        state.attempted_at_unix_nanos.into(),
+                        error.into(),
+                        error_kind.into(),
+                    ]
+                    .into_iter()
+                    .chain(retry_values(retry.as_ref())),
+                )
                 .on_conflict(
                     OnConflict::column(SearchIndexStates::TargetId)
-                        .update_columns([
+                        .update_columns(with_retry_columns([
                             SearchIndexStates::ProviderDisplayName,
                             SearchIndexStates::State,
                             SearchIndexStates::AttemptedAtUnixNanos,
                             SearchIndexStates::Error,
                             SearchIndexStates::ErrorKind,
-                        ])
+                        ]))
                         .to_owned(),
                 )
                 .to_owned(),
@@ -529,6 +578,9 @@ pub(super) struct FailedFunctionState<'a> {
     pub(super) principal: &'a Principal,
     pub(super) attempted_at_unix_nanos: i64,
     pub(super) error: String,
+    pub(super) retry: RetryRule,
+    /// The definition revision the attempt tried.
+    pub(super) revision: u64,
 }
 
 /// Upserts a Saved Function row by Workspace and document id, as
@@ -583,7 +635,7 @@ pub(super) async fn write_failed_function_state(
         .execute(
             Query::insert()
                 .into_table(SearchIndexStates::Table)
-                .columns([
+                .columns(with_retry_columns([
                     SearchIndexStates::WorkspaceId,
                     SearchIndexStates::TargetId,
                     SearchIndexStates::Kind,
@@ -593,30 +645,145 @@ pub(super) async fn write_failed_function_state(
                     SearchIndexStates::State,
                     SearchIndexStates::AttemptedAtUnixNanos,
                     SearchIndexStates::Error,
-                ])
-                .values_panic([
-                    state.workspace_id.to_string().into(),
-                    function_id.clone().into(),
-                    SAVED_FUNCTION.into(),
-                    function_id.into(),
-                    state.principal.id().as_str().into(),
-                    state.principal.kind().as_storage_str().into(),
-                    FAILED.into(),
-                    state.attempted_at_unix_nanos.into(),
-                    state.error.into(),
-                ])
+                    SearchIndexStates::FailedSavedFunctionRevision,
+                ]))
+                .values_panic(
+                    [
+                        state.workspace_id.to_string().into(),
+                        function_id.clone().into(),
+                        SAVED_FUNCTION.into(),
+                        function_id.into(),
+                        state.principal.id().as_str().into(),
+                        state.principal.kind().as_storage_str().into(),
+                        FAILED.into(),
+                        state.attempted_at_unix_nanos.into(),
+                        state.error.into(),
+                        revision_value(state.revision),
+                    ]
+                    .into_iter()
+                    .chain(retry_values(Some(&state.retry))),
+                )
                 .on_conflict(
                     OnConflict::column(SearchIndexStates::TargetId)
-                        .update_columns([
+                        .update_columns(with_retry_columns([
                             SearchIndexStates::AttemptedAtUnixNanos,
                             SearchIndexStates::Error,
-                        ])
+                            SearchIndexStates::FailedSavedFunctionRevision,
+                        ]))
                         .to_owned(),
                 )
                 .to_owned(),
         )
         .await?;
     Ok(())
+}
+
+/// The [`RETRY_COLUMNS`] values of a failed attempt's retry rule, all
+/// `NULL` without one.
+fn retry_values(retry: Option<&RetryRule>) -> [SimpleExpr; 3] {
+    match retry {
+        Some(retry) => [
+            retry.attempts.into(),
+            retry.retry_after_unix_nanos.into(),
+            retry.coral_version.clone().into(),
+        ],
+        None => [
+            Option::<i64>::None.into(),
+            Option::<i64>::None.into(),
+            Option::<String>::None.into(),
+        ],
+    }
+}
+
+/// A definition revision as its `BIGINT` column holds it. A revision past
+/// the column's range is stored as `NULL`, which matches no revision.
+fn revision_value(revision: u64) -> SimpleExpr {
+    i64::try_from(revision).ok().into()
+}
+
+/// What a target's `failed` state row records for its next attempt.
+#[derive(sqlx::FromRow)]
+struct FailedStateRow {
+    failed_saved_function_revision: Option<i64>,
+    #[sqlx(flatten)]
+    retry: RetryColumns,
+}
+
+/// Reads the target's state row in the Workspace, when its last attempt
+/// failed. `kind` is the state row's kind.
+async fn failed_state(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    kind: &str,
+    target_id: String,
+) -> Result<Option<FailedStateRow>, Error> {
+    transaction
+        .fetch_optional(
+            Query::select()
+                .columns(with_retry_columns([
+                    SearchIndexStates::FailedSavedFunctionRevision,
+                ]))
+                .from(SearchIndexStates::Table)
+                .and_where(Expr::col(SearchIndexStates::WorkspaceId).eq(workspace_id.to_string()))
+                .and_where(Expr::col(SearchIndexStates::Kind).eq(kind))
+                .and_where(Expr::col(SearchIndexStates::TargetId).eq(target_id))
+                .and_where(Expr::col(SearchIndexStates::State).eq(FAILED))
+                .to_owned(),
+        )
+        .await
+}
+
+/// Reads the retry rule of the Generation's state row, when its last
+/// attempt failed.
+pub(super) async fn failed_generation_retry_rule(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    generation_id: &ProviderGenerationId,
+) -> Result<Option<RetryRule>, Error> {
+    let row = failed_state(
+        transaction,
+        workspace_id,
+        OPERATION,
+        generation_id.to_string(),
+    )
+    .await?;
+    Ok(row.map(|row| row.retry.into()))
+}
+
+/// The failure a Saved Function's state row records.
+pub(super) struct FunctionFailure {
+    pub(super) retry: RetryRule,
+    /// The definition revision the attempt tried. `None` on a row written
+    /// before Coral recorded it.
+    pub(super) revision: Option<u64>,
+}
+
+impl From<FailedStateRow> for FunctionFailure {
+    fn from(row: FailedStateRow) -> Self {
+        Self {
+            retry: row.retry.into(),
+            revision: row
+                .failed_saved_function_revision
+                .and_then(|revision| u64::try_from(revision).ok()),
+        }
+    }
+}
+
+/// Reads the failure of the Saved Function's state row, when its last
+/// attempt failed.
+pub(super) async fn failed_function(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    function_id: &SavedFunctionId,
+) -> Result<Option<FunctionFailure>, Error> {
+    let row = failed_state(
+        transaction,
+        workspace_id,
+        SAVED_FUNCTION,
+        function_id.to_string(),
+    )
+    .await?;
+    Ok(row.map(FunctionFailure::from))
 }
 
 /// Deletes a Saved Function's state row, if an earlier attempt left one.
@@ -655,46 +822,55 @@ pub(super) struct RecordedGeneration {
 pub(super) enum RecordedOutcome {
     /// Indexed under this Provider display name.
     Complete { display_name: String },
-    /// Failed at this time.
-    Failed { attempted_at_unix_nanos: i64 },
+    /// Failed, to be retried by this rule.
+    Failed { retry: RetryRule },
+}
+
+#[derive(sqlx::FromRow)]
+struct RecordedGenerationRow {
+    workspace_id: String,
+    provider_generation_id: String,
+    state: String,
+    provider_display_name: String,
+    #[sqlx(flatten)]
+    retry: RetryColumns,
 }
 
 /// Reads every Generation's state row in every Workspace.
 pub(super) async fn recorded_generations(
     transaction: &mut Transaction<'_>,
 ) -> Result<Vec<RecordedGeneration>, IndexError> {
-    let rows: Vec<(String, String, String, String, i64)> = transaction
+    let rows: Vec<RecordedGenerationRow> = transaction
         .fetch_all(
             Query::select()
-                .columns([
+                .columns(with_retry_columns([
                     SearchIndexStates::WorkspaceId,
                     SearchIndexStates::ProviderGenerationId,
                     SearchIndexStates::State,
                     SearchIndexStates::ProviderDisplayName,
-                    SearchIndexStates::AttemptedAtUnixNanos,
-                ])
+                ]))
                 .from(SearchIndexStates::Table)
                 .and_where(Expr::col(SearchIndexStates::Kind).eq(OPERATION))
                 .to_owned(),
         )
         .await?;
     rows.into_iter()
-        .map(
-            |(workspace_id, generation_id, state, display_name, attempted_at_unix_nanos)| {
-                // The state check admits only `complete` and `failed`.
-                let outcome = if state == COMPLETE {
-                    RecordedOutcome::Complete { display_name }
-                } else {
-                    RecordedOutcome::Failed {
-                        attempted_at_unix_nanos,
-                    }
-                };
-                Ok(RecordedGeneration {
-                    generation: workspace_generation(&workspace_id, &generation_id)?,
-                    outcome,
-                })
-            },
-        )
+        .map(|row| {
+            // The state check admits only `complete` and `failed`.
+            let outcome = if row.state == COMPLETE {
+                RecordedOutcome::Complete {
+                    display_name: row.provider_display_name,
+                }
+            } else {
+                RecordedOutcome::Failed {
+                    retry: row.retry.into(),
+                }
+            };
+            Ok(RecordedGeneration {
+                generation: workspace_generation(&row.workspace_id, &row.provider_generation_id)?,
+                outcome,
+            })
+        })
         .collect()
 }
 
@@ -926,31 +1102,39 @@ pub(super) async fn recorded_functions(
 /// compares it.
 pub(super) struct FailedFunction {
     pub(super) function: WorkspaceFunction,
-    pub(super) attempted_at_unix_nanos: i64,
+    pub(super) failure: FunctionFailure,
+}
+
+#[derive(sqlx::FromRow)]
+struct FailedFunctionRow {
+    workspace_id: String,
+    saved_function_id: String,
+    #[sqlx(flatten)]
+    failure: FailedStateRow,
 }
 
 /// Reads every Saved Function whose last attempt failed.
 pub(super) async fn failed_functions(
     transaction: &mut Transaction<'_>,
 ) -> Result<Vec<FailedFunction>, IndexError> {
-    let rows: Vec<(String, String, i64)> = transaction
+    let rows: Vec<FailedFunctionRow> = transaction
         .fetch_all(
             Query::select()
-                .columns([
+                .columns(with_retry_columns([
                     SearchIndexStates::WorkspaceId,
                     SearchIndexStates::SavedFunctionId,
-                    SearchIndexStates::AttemptedAtUnixNanos,
-                ])
+                    SearchIndexStates::FailedSavedFunctionRevision,
+                ]))
                 .from(SearchIndexStates::Table)
                 .and_where(Expr::col(SearchIndexStates::Kind).eq(SAVED_FUNCTION))
                 .to_owned(),
         )
         .await?;
     rows.into_iter()
-        .map(|(workspace_id, function_id, attempted_at_unix_nanos)| {
+        .map(|row| {
             Ok(FailedFunction {
-                function: workspace_function(&workspace_id, &function_id)?,
-                attempted_at_unix_nanos,
+                function: workspace_function(&row.workspace_id, &row.saved_function_id)?,
+                failure: row.failure.into(),
             })
         })
         .collect()
