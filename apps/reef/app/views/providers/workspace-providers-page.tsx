@@ -500,7 +500,7 @@ function ProvidersTableScreen({
     for (const { provider, matching, listed } of visibleByProvider) {
       // The operation the drawer shows opens its provider and group, so its row is there.
       const linked = provider.id === selectedProviderId ? selectedOperation : null
-      const key = `provider:${provider.id}`
+      const key = providerHeadingKey(provider.id)
       const section: ProviderSection = {
         provider,
         index: flat.length,
@@ -541,7 +541,7 @@ function ProvidersTableScreen({
       }
       const groups = new Map<string, OperationView[]>()
       for (const operation of listed) {
-        const label = operation.group || 'Other'
+        const label = groupLabel(operation)
         const members = groups.get(label)
         if (members) members.push(operation)
         else groups.set(label, [operation])
@@ -549,7 +549,7 @@ function ProvidersTableScreen({
       for (const [group, members] of [...groups.entries()].toSorted(([a], [b]) =>
         caseFolded(a).localeCompare(caseFolded(b)),
       )) {
-        const groupKey = `group:${provider.id}:${group}`
+        const groupKey = groupHeadingKey(provider.id, group)
         const groupSection: ProviderSection['groups'][number] = {
           group,
           index: flat.length,
@@ -609,6 +609,33 @@ function ProvidersTableScreen({
     },
     [virtual],
   )
+  // The headings the view lists, groups inside collapsed providers included,
+  // so collapsing all leaves each provider's groups collapsed when it opens.
+  const headingKeys = useMemo(
+    () =>
+      visibleByProvider.flatMap(({ provider, listed }) => [
+        providerHeadingKey(provider.id),
+        ...new Set(listed.map((o) => groupHeadingKey(provider.id, groupLabel(o)))),
+      ]),
+    [visibleByProvider],
+  )
+  // A provider shows rows while it is open and lists one open group, or no groups.
+  const anyExpanded = sections.some(
+    (section) =>
+      !section.collapsed &&
+      (section.groups.length === 0 || section.groups.some((group) => !group.collapsed)),
+  )
+  const toggleAllCollapsed = () => {
+    setCollapsed((current) => {
+      const next = new Set(current)
+      for (const key of headingKeys) {
+        if (anyExpanded) next.add(key)
+        else next.delete(key)
+      }
+      return next
+    })
+    tableRef.current?.scrollTo?.({ top: 0 })
+  }
   // A new tab starts at its top. This runs before the reveal, so an
   // operation route still scrolls to its row.
   useEffect(() => {
@@ -930,7 +957,20 @@ function ProvidersTableScreen({
                   <span className={visuallyHidden}>Select all matching operations</span>
                 </Inputs.Checkbox>
               </span>
-              <span role="columnheader">Operation name</span>
+              <span
+                role="columnheader"
+                className={classNames(styles.nameHeader, Table.groupToggleHeading)}
+              >
+                <Button.IconButton
+                  variant="bare"
+                  size="22"
+                  name={anyExpanded ? 'ChevronsDownUp' : 'ChevronsUpDown'}
+                  tooltipText={anyExpanded ? 'Collapse all' : 'Expand all'}
+                  disabled={sections.length === 0}
+                  onClick={toggleAllCollapsed}
+                />
+                Operation name
+              </span>
               <span role="columnheader" className={styles.policyHeader}>
                 Policy
               </span>
@@ -963,6 +1003,8 @@ function ProvidersTableScreen({
               form={form}
               providers={providers}
               selected={selected}
+              showingSelected={selectedView !== null}
+              onShowSelected={() => (selectedView ? setSelectedView(null) : showSelected())}
               onClear={() => {
                 setSelected(new Set())
                 setSelectedView(null)
@@ -1198,6 +1240,12 @@ const TableSections = memo(function TableSections({
 })
 
 const OPERATION_FILTER_ID = 'operation-filter'
+
+// A heading's key in the collapsed set and the cursor order.
+const providerHeadingKey = (providerId: string) => `provider:${providerId}`
+const groupHeadingKey = (providerId: string, group: string) => `group:${providerId}:${group}`
+/** The operation group a heading lists the operation under. */
+const groupLabel = (operation: OperationView) => operation.group || 'Other'
 const PROVIDER_GROUP_DOM_ID = 'provider-group-'
 
 function providerGroupDomId(provider: string) {
@@ -1287,15 +1335,20 @@ function BulkPolicyForm({
   form,
   onClear,
   onConfirmed,
+  onShowSelected,
   providers,
   selected,
+  showingSelected,
 }: {
   canChange: boolean
   form: FormContext
   onClear: () => void
   onConfirmed: (confirmed: SelectionKey[]) => void
+  /** Opens the selected view, or leaves it while it shows. */
+  onShowSelected: () => void
   providers: ProviderView[]
   selected: Set<SelectionKey>
+  showingSelected: boolean
 }) {
   const mutations = usePolicyMutations()
   const [access, setAccess] = useState<PolicyState>('approval_required')
@@ -1330,7 +1383,18 @@ function BulkPolicyForm({
     >
       <Fields form={form} intent="policy" />
       <input type="hidden" name="access" value={access} />
-      <Typography.BodyStrong as="span">{`${selected.size.toLocaleString('en-US')} selected`}</Typography.BodyStrong>
+      <Tooltip
+        content={showingSelected ? 'Show all operations.' : 'Show only the selected operations.'}
+      >
+        <Button.TextButton
+          type="button"
+          variant="secondary"
+          aria-pressed={showingSelected}
+          onClick={onShowSelected}
+        >
+          {`${selected.size.toLocaleString('en-US')} selected`}
+        </Button.TextButton>
+      </Tooltip>
       <Picker
         label="Bulk policy"
         options={bulkPolicyOptions}
