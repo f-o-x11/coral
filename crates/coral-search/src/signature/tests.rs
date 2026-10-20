@@ -112,6 +112,9 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
         "export default function mapped(): Promise<{ [K in \"a\" | \"b\"]: number }>;";
     let arrow = "declare const g: (input: {\n    q: string;\n}) => number;\nexport default g;\n";
     let alias_union = "type Mode = 'a' | 'b';\ntype Modes = Mode[];\ninterface Out { x: number }\nexport default function f(input: { mode: Mode; modes?: Modes; limit?: number }): Promise<Out[]>;";
+    let promised_cycle = "type Result = Promise<Result>;\nexport default function loop(): Result;";
+    let promised_chain = "type Outer = Inner;\ntype Inner = Promise<Outer>;\nexport default function chain(): Outer;";
+    let promised_through_alias = "type Result = Promise<Next>;\ntype Next = Result;\nexport default function relay(): Result;";
     let recursive = "type Tree = Tree[] | string;\nexport default function walk(input: { tree: Tree }): number;";
     let unreadable = "export default something weird";
     let keyed_record = "export default function keyed(input: { label?: string } & Record<\"id\", unknown>): number;";
@@ -261,6 +264,21 @@ fn signature_lines_inline_the_input_one_level_and_name_the_rest() {
             alias_union,
             Callable::SavedFunction { leaf: "f" },
             "f(input: { mode: \"a\" | \"b\"; modes?: (\"a\" | \"b\")[]; limit?: number }): Promise<{ x: number }[]>",
+        ),
+        (
+            promised_cycle,
+            Callable::SavedFunction { leaf: "loop" },
+            "loop(): Promise<…>",
+        ),
+        (
+            promised_chain,
+            Callable::SavedFunction { leaf: "chain" },
+            "chain(): Promise<…>",
+        ),
+        (
+            promised_through_alias,
+            Callable::SavedFunction { leaf: "relay" },
+            "relay(): Promise<…>",
         ),
         (
             recursive,
