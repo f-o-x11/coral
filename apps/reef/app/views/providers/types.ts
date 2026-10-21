@@ -310,6 +310,8 @@ export interface RecipeConfigurationView {
     >
   > & { servers?: RecipeServerView[] }
   application?: NonNullable<ConfigurationReviewView['application']>
+  /** Help below the client ID field, as Markdown, such as where to create the application. */
+  clientConfigHintMarkdown?: string
 }
 
 export interface SetupView {
