@@ -97,11 +97,65 @@ const meta = {
       )
     },
   ],
-  play: async ({ canvasElement, parameters }) => {
+  play: async ({ canvasElement, parameters, args }) => {
     const opened = await within(canvasElement.ownerDocument.body).findByRole('dialog')
     await waitFor(() => expect(opened).toBeVisible())
     for (const text of [parameters.evidence ?? []].flat())
       await expect(opened).toHaveTextContent(text)
+    // An operation, log or emission shows beside its Run's accepted program, highlighted at
+    // the line Coral stored for it, where that program makes its call. Every one has one here.
+    const row = args.page.selectedRow
+    const detail = args.page.detail
+    const call =
+      row?.kind === 'invocation'
+        ? row.callPath.slice(row.callPath.lastIndexOf('.') + 1)
+        : row?.kind === 'output' && row.eventKind === 'program.emitted'
+          ? 'emit'
+          : row?.kind === 'output' && row.eventKind === 'program.logged'
+            ? /^(debug|info|warn|error|log)$/
+            : null
+    if (call && (row?.kind === 'invocation' || row?.kind === 'output')) {
+      const location = row.sourceLocation!
+      await expect(location).toBeDefined()
+      const program =
+        detail?.kind === 'invocation' || detail?.kind === 'output' ? detail.context?.source : null
+      const named = program!.split('\n')[location.line - 1]!.slice(location.column - 1)
+      const called = named.split('(')[0]!
+      if (typeof call === 'string') await expect(called).toBe(call)
+      else await expect(called).toMatch(call)
+      const source = within(opened).getByRole('region', { name: 'Accepted source' })
+      await waitFor(() =>
+        expect(
+          [...source.querySelectorAll<HTMLElement>('[data-highlighted]')].map(
+            (line) => line.dataset.line,
+          ),
+        ).toEqual([`${location.line}`]),
+      )
+      await expect(within(source).getByRole('status')).toHaveTextContent(`Line ${location.line}`)
+    }
+    // Beside a Run's source, a decision sits in the record pane's own footer, below the
+    // scrolling evidence, so the evidence's fade never covers it. A review's one named
+    // region holds both its evidence and that decision.
+    const selected = within(opened).queryByRole('region', { name: 'Selected record' })
+    const decisions = selected
+      ? within(selected).queryAllByRole('button', { name: /this call$|^Decline$|^Connect / })
+      : []
+    for (const control of decisions) {
+      const footer = control.closest('footer')!
+      await expect(selected).toContainElement(footer)
+      await expect(footer.previousElementSibling).toContainElement(
+        within(selected!).getAllByRole('heading')[0]!,
+      )
+    }
+    const approvals = selected
+      ? within(selected).queryAllByRole('button', { name: /this call$/ })
+      : []
+    if (approvals.length) {
+      const reviews = within(opened).getAllByRole('region', { name: /^Review / })
+      await expect(reviews).toHaveLength(1)
+      await expect(reviews[0]!.lastElementChild).toBe(approvals[0]!.closest('footer'))
+      await expect(reviews[0]!.querySelector('header')).not.toBeNull()
+    }
   },
 } satisfies Meta<typeof Activity>
 export default meta
@@ -170,8 +224,14 @@ const toolPage = (value: InteractionRow, evidence: InteractionEvidence) =>
     interaction: value,
     evidence,
   })
+/** A Run event, beside the Run's accepted program, as Coral's loader reads it. */
 const eventPage = (event: RunEvent, label: string) =>
-  panelPage(outputRow(event, label), { kind: 'output', run: run().name, event })
+  panelPage(outputRow(event, label), {
+    kind: 'output',
+    run: run().name,
+    event,
+    context: runDetail(run()),
+  })
 
 // Tasks ---------------------------------------------------------------------
 
@@ -1446,9 +1506,12 @@ export const FinalValue: Story = {
     await expect(within(dialog).queryByText('Final value', { selector: 'summary' })).toBeNull()
     for (const token of ['"reminded"', '24', '"owners"', '9', '18450.70', '"INV-4180"'])
       await expect(value).toHaveTextContent(token)
-    // A returned value is not an emission: no emitted-output card or title.
+    // A returned value is not an emission: no emitted-output card or title. The Run's
+    // accepted source below may call coral.emit; the selected record's own pane does not.
     await expect(within(dialog).queryByRole('region', { name: 'Emitted value' })).toBeNull()
-    await expect(dialog).not.toHaveTextContent('coral.emit')
+    await expect(
+      within(dialog).getByRole('region', { name: 'Selected record' }),
+    ).not.toHaveTextContent('coral.emit')
   },
 }
 /** A Run that returned nothing shows no card and no sentence about it. */
@@ -1911,6 +1974,8 @@ const exactCreateProviderArguments =
   `"source":{"kind":"openapi_document","document":${JSON.stringify(inlineDocument)}},` +
   '"credentialRoute":"fixed","maxForecasts":9007199254740993,' +
   '"label":"first as sent","label":"second as sent"}'
+/** The program that makes this exact call, its arguments written out as sent. */
+const exactCreateProviderProgram = `return await coral.workspace.createProvider(${exactCreateProviderArguments})`
 /** Edge case: createProvider JSON that rows would change, a large integer and a duplicate key,
  * shows whole, exactly as sent, in one block. The ordinary arguments renderer does this for any
  * such JSON; nothing here is special to OpenAPI: no copy apart, no placeholder. */
@@ -1924,6 +1989,7 @@ export const ApprovalInlineOpenApiDocument: Story = {
         providerLabel: 'Coral workspace',
         arguments: exactCreateProviderArguments,
       }),
+      { source: exactCreateProviderProgram },
     ),
     { evidence: ['9007199254740993', '"first as sent"', '"second as sent"'] },
   ),
@@ -1969,6 +2035,9 @@ const createProviderCall = {
     client: { client_id: 'weather-client', authentication: 'client_secret_post' },
   },
 }
+/** A typical program that adds the provider with this call. */
+const createProviderProgram = `const call = ${JSON.stringify(createProviderCall, null, 2)}
+return await coral.workspace.createProvider(call)`
 /** A typical createProvider call through the ordinary arguments: one row per field, and the
  * inline document whole inside `source`, as sent. The Arguments disclosure is the one way to
  * fold it; nothing is special to OpenAPI. */
@@ -1982,6 +2051,7 @@ export const ApprovalCreateProviderOpenApi: Story = {
         providerLabel: 'Coral workspace',
         arguments: JSON.stringify(createProviderCall),
       }),
+      { source: createProviderProgram },
     ),
     { evidence: 'coral.workspace.createProvider' },
   ),
@@ -2172,6 +2242,7 @@ export const ApprovalLongCallPathNarrow = panel(
         reference: 'a'.repeat(160),
       }),
     }),
+    { source: `await ${longCallPath}({ contact, reference })` },
   ),
   { narrow: true, evidence: longCallPath },
 )
@@ -2261,16 +2332,23 @@ function connectionStory(
         const footer = decline.closest('footer')!
         await expect(footer).toContainElement(connect)
         await expect(footer.querySelector('time')).toBeNull()
-        // The panel's own footer, pinned to the drawer's bottom as an approval's is.
-        await expect(getComputedStyle(footer).position).toBe('sticky')
-        await expect(footer.closest('section')!.parentElement).toBe(
-          dialog.querySelector('section')!.parentElement,
-        )
+        // The record's own footer, pinned as an approval's is: below the pane's scrolling
+        // evidence beside the Run's source, or to the drawer's bottom without it.
+        const pane = opened.queryByRole('region', { name: 'Selected record' })
+        if (pane) {
+          await expect(pane).toContainElement(footer)
+          await expect(footer.previousElementSibling).toContainElement(headers[0]!)
+        } else {
+          await expect(getComputedStyle(footer).position).toBe('sticky')
+          await expect(footer.closest('section')).toContainElement(headers[0]!)
+        }
         // While the live view reconnects, neither choice is offered.
         await expect(decline).toHaveProperty('disabled', Boolean(options.reconnecting))
         await expect(connect).toHaveProperty('disabled', Boolean(options.reconnecting))
       } else {
-        await expect(opened.getByRole('status')).toBeVisible()
+        // The Run's source pane keeps its own status; the record states one outcome.
+        const record = opened.queryByRole('region', { name: 'Selected record' }) ?? dialog
+        await expect(within(record).getByRole('status')).toBeVisible()
         await expect(opened.queryByRole('button', { name: /Decline|Connect/ })).toBeNull()
       }
       if (options.fits) await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth)

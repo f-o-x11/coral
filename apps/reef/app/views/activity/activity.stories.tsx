@@ -3,10 +3,12 @@ import { createRoutesStub, useSearchParams } from 'react-router'
 import { expect, fn, waitFor, within } from 'storybook/test'
 import { PageLayout } from '@/wax/components/page-layout'
 import { trail } from '@/views/management/layout'
+import { resizeViewport } from '../../../.storybook/browser'
 import { Activity } from './activity'
 import { ActionReviewSession } from '../actions/review'
 import { stored } from './discovery/fixtures'
 import { discoveryView, functionTarget } from './discovery/response'
+import { programAt } from './side-panel-fixtures'
 import { operationOwner } from '@/lib/call-root'
 import { freezeStoryClock, minutesAfterStoryNow } from './story-clock'
 import type {
@@ -49,41 +51,67 @@ async function expectAlignedHeaders(dialog: HTMLElement) {
   }
 }
 
-/** Reading the evidence never scrolls the decision out of the drawer. The pinned header and
- * footer sit flush on the drawer's edges, whichever stylesheet loads first. */
-async function expectPinnedFooter(dialog: HTMLElement, names: string[]) {
-  const controls = names.map((name) => within(dialog).getByRole('button', { name }))
-  const header = dialog.querySelector('header')!
-  const footer = controls[0]!.closest('footer')!
-  await waitFor(() => expect(dialog.scrollHeight).toBeGreaterThan(dialog.clientHeight * 2))
-  const shown = () => {
-    const edge = dialog.getBoundingClientRect()
-    return controls.every((control) => {
-      const box = control.getBoundingClientRect()
-      return box.top >= edge.top && box.bottom <= edge.bottom
+/** The element that scrolls `pane`'s content: the drawer itself, or a split pane's viewport. */
+function scrollerIn(pane: HTMLElement) {
+  if (/auto|scroll/.test(getComputedStyle(pane).overflowY)) return pane
+  return [...pane.querySelectorAll<HTMLElement>('*')].find((element) =>
+    /auto|scroll/.test(getComputedStyle(element).overflowY),
+  )!
+}
+
+/** The selected record's decision sits below its scrolling evidence, never inside it: it
+ * stays in view, the evidence's fade never covers it, and a click reaches each control. */
+async function expectDecisionBelowEvidence(pane: HTMLElement, names: string[]) {
+  const scroller = scrollerIn(pane)
+  for (const name of names) {
+    // One control per choice: the footer is not repeated inside the evidence.
+    const [control, ...copies] = within(pane).getAllByRole('button', { name })
+    await expect(copies).toEqual([])
+    await expect(scroller).not.toContainElement(control!)
+    await waitFor(() => {
+      const box = control!.getBoundingClientRect()
+      const bounds = pane.getBoundingClientRect()
+      expect(box.top).toBeGreaterThanOrEqual(scroller.getBoundingClientRect().bottom)
+      expect(box.bottom).toBeLessThanOrEqual(bounds.bottom)
+      for (const y of [box.top + 2, box.top + box.height / 2, box.bottom - 2])
+        expect(control).toContainElement(
+          document.elementFromPoint(box.left + box.width / 2, y) as HTMLElement,
+        )
     })
   }
-  // A sticky edge sticks once the content runs past it: the header after any scroll, the
-  // footer until the end. Stuck, each covers the drawer's padding, flush with its edge.
-  const flush = (fraction: number) => {
-    const edge = dialog.getBoundingClientRect()
-    const top = edge.top + dialog.clientTop
-    const bottom = top + dialog.clientHeight
-    const headerFlush = Math.abs(header.getBoundingClientRect().top - top) <= 1
-    const footerFlush = Math.abs(footer.getBoundingClientRect().bottom - bottom) <= 1
-    return (fraction === 0 || headerFlush) && (fraction === 1 || footerFlush)
-  }
+}
+
+/** Reading the evidence never scrolls the decision out of the selected record's pane. */
+async function expectPinnedFooter(pane: HTMLElement, names: string[]) {
+  const scroller = scrollerIn(pane)
+  await waitFor(() => expect(scroller.scrollHeight).toBeGreaterThan(scroller.clientHeight * 2))
   for (const fraction of [0, 0.5, 1]) {
-    dialog.scrollTop = (dialog.scrollHeight - dialog.clientHeight) * fraction
-    await waitFor(() => expect(shown()).toBe(true))
-    await waitFor(() => expect(flush(fraction)).toBe(true))
+    scroller.scrollTop = (scroller.scrollHeight - scroller.clientHeight) * fraction
+    await expectDecisionBelowEvidence(pane, names)
   }
   // Long content wraps or scrolls inside its block, never the drawer sideways.
-  await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth)
+  await expect(scroller.scrollWidth).toBeLessThanOrEqual(scroller.clientWidth)
 }
+
+/** The height of the fade that marks evidence below the visible part of `scroller`. */
+const fadeBelow = (scroller: HTMLElement) =>
+  parseFloat(getComputedStyle(scroller, '::after').height) || 0
 
 /** A short phone screen: Chromatic reads `viewports`; the Vitest run reads the `viewport` global. */
 const shortScreen = { viewport: { value: 'mobile1', isRotated: false } }
+
+/** The Run's accepted source beside the selected record highlights `line`, and says so. */
+async function expectSourceLine(dialog: HTMLElement, line: number) {
+  const source = within(dialog).getByRole('region', { name: 'Accepted source' })
+  await waitFor(() =>
+    expect(
+      [...source.querySelectorAll<HTMLElement>('[data-highlighted]')].map(
+        (item) => item.dataset.line,
+      ),
+    ).toEqual([`${line}`]),
+  )
+  await expect(within(source).getByRole('status')).toHaveTextContent(`Line ${line}`)
+}
 
 const openDrawer = async (canvasElement: HTMLElement, name?: string) =>
   within(canvasElement.ownerDocument.body).findByRole('dialog', name ? { name } : undefined)
@@ -129,6 +157,14 @@ const execution: ActivityRow & { kind: 'run' } = {
     agent: '',
   },
 }
+/** The program the Run accepted; its operation call and its emission sit at their own lines. */
+const program = [
+  "const invoices = await coral.providers.billing.listInvoices({ status: 'overdue' })",
+  'const owner = await coral.providers.crm.getOwner({ invoice: invoices.data[0].id })',
+  "coral.emit({ invoices: 24, groupedBy: 'owner' })",
+  "await coral.providers.mail.send({ to: owner.email, subject: 'Invoice INV-4171 is overdue' })",
+  'return { invoices: 24 }',
+].join('\n')
 const call: ActivityRow & { kind: 'invocation' } = {
   kind: 'invocation',
   name: invocation,
@@ -148,6 +184,7 @@ const call: ActivityRow & { kind: 'invocation' } = {
   requiresAction: true,
   dispatchedAt: null,
   waitingNanos: '221000000000',
+  sourceLocation: programAt('coral.providers.mail.send', program),
 }
 const emission: ActivityRow = {
   kind: 'output',
@@ -158,6 +195,7 @@ const emission: ActivityRow = {
   startedAt: at,
   eventKind: 'program.emitted',
   agent: '',
+  sourceLocation: programAt('coral.emit', program),
 }
 const standalone: ActivityRow & { kind: 'run' } = {
   ...execution,
@@ -187,6 +225,15 @@ const tool = (
   acceptedRun: '',
   agent: '',
 })
+// An approval is always reviewed inside its Run, and any call shows beside the Run's program.
+const approvalContext: RunDetail = {
+  kind: 'run',
+  run: execution,
+  submission: execution.submission,
+  source: program,
+  linkedFunctions: [],
+  terminal: { kind: 'unavailable' },
+}
 const detail: InvocationDetail = {
   kind: 'invocation',
   invocation: call,
@@ -196,15 +243,7 @@ const detail: InvocationDetail = {
   requests: [{ kind: 'approval', name: `${workspace}/approvals/mail` }],
   request: null,
   requestUnavailable: false,
-}
-// An approval is always reviewed inside its Run.
-const approvalContext: RunDetail = {
-  kind: 'run',
-  run: execution,
-  submission: execution.submission,
-  source: 'export default async () => null',
-  linkedFunctions: [],
-  terminal: { kind: 'unavailable' },
+  context: approvalContext,
 }
 const page: ActivityPage = {
   rows: [
@@ -233,6 +272,7 @@ const page: ActivityPage = {
           ...call,
           name: `${workspace}/invocations/list`,
           callPath: 'billing.listInvoices',
+          sourceLocation: programAt('coral.providers.billing.listInvoices', program),
           state: 'ended',
           outcome: 'upstream_outcome',
           requiresAction: false,
@@ -242,6 +282,7 @@ const page: ActivityPage = {
           ...call,
           name: `${workspace}/invocations/uncertain`,
           callPath: 'crm.getOwner',
+          sourceLocation: programAt('coral.providers.crm.getOwner', program),
           state: 'ended',
           outcome: 'indeterminate',
           requiresAction: false,
@@ -299,7 +340,10 @@ export default meta
 type Story = StoryObj<typeof meta>
 export const MixedHistory: Story = {
   play: async ({ canvasElement }) => {
-    const drawer = within(await within(canvasElement.ownerDocument.body).findByRole('dialog'))
+    const dialog = await within(canvasElement.ownerDocument.body).findByRole('dialog')
+    const drawer = within(dialog)
+    // The call shows beside its Run's program, at the line that made it.
+    await expectSourceLine(dialog, 4)
     await expect(drawer.getByText('Arguments (3)')).toBeVisible()
     await expect(drawer.getByRole('button', { name: 'Close details' })).toBeVisible()
     await expect(drawer.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
@@ -406,6 +450,8 @@ export const ContextImpact: Story = {
               ...emission,
               name: `${run}/final`,
               eventKind: 'run.ended',
+              // A Run's end is no call of the program's.
+              sourceLocation: undefined,
               label: 'final value',
               contextImpactBytes: '14500',
             },
@@ -478,6 +524,8 @@ export const StatusMarkers: Story = {
               outcome: 'upstream_outcome',
               requiresAction: false,
               callPath: 'coral.providers.linear.listIssues',
+              // A list layout only; nothing opens it beside a program.
+              sourceLocation: undefined,
             },
             {
               ...call,
@@ -486,6 +534,8 @@ export const StatusMarkers: Story = {
               outcome: 'coral_failure',
               requiresAction: false,
               callPath: 'coral.providers.linear.updateIssue',
+              // A list layout only; nothing opens it beside a program.
+              sourceLocation: undefined,
             },
             {
               ...call,
@@ -494,6 +544,8 @@ export const StatusMarkers: Story = {
               outcome: 'indeterminate',
               requiresAction: false,
               callPath: 'coral.providers.linear.createIssue',
+              // A list layout only; nothing opens it beside a program.
+              sourceLocation: undefined,
             },
           ],
           next: '',
@@ -563,6 +615,8 @@ const busyTask = {
         ...call,
         name: `${workspace}/invocations/${i}`,
         callPath: `billing.listInvoices.${i}`,
+        // A list layout only; nothing opens it beside a program.
+        sourceLocation: undefined,
         state: 'ended' as const,
         outcome: 'upstream_outcome',
         requiresAction: false,
@@ -675,6 +729,8 @@ function addLargeRun(row: ActivityRow & { kind: 'run' }, operations: number) {
       run: row.name,
       startedAt: row.startedAt,
       callPath: `billing.listInvoices.page${k + 1}`,
+      // A list layout only; nothing opens it beside a program.
+      sourceLocation: undefined,
       state: 'ended' as const,
       outcome: k % 9 === 8 ? 'coral_failure' : 'upstream_outcome',
       requiresAction: false,
@@ -1013,6 +1069,8 @@ export const FinalValueOnExec: Story = {
               ...emission,
               name: `${run}/final`,
               eventKind: 'run.ended',
+              // A Run's end is no call of the program's.
+              sourceLocation: undefined,
               label: 'final value',
               contextImpactBytes: '15',
             },
@@ -1024,7 +1082,8 @@ export const FinalValueOnExec: Story = {
       detail: {
         kind: 'run',
         run: { ...execution, state: 'succeeded', requiresAction: false },
-        source: 'coral.emit({progress: "ready"}); return {invoices: 24};',
+        // The program that made the emission listed above and returned this value.
+        source: program,
         linkedFunctions: [],
         terminal: { kind: 'succeeded', finalValue: '{"invoices":24}' },
       },
@@ -1156,6 +1215,7 @@ export const EmissionAfterFailure: Story = {
           occurredAt: at,
           value: '{"invoices":24,"groupedBy":"owner"}',
         },
+        context: approvalContext,
       },
     },
   },
@@ -1170,6 +1230,8 @@ export const EmissionAfterFailure: Story = {
       '"groupedBy"',
     )
     await expect(dialog).not.toHaveTextContent('Technical details')
+    // Beside it, the Run's program, at the line that emitted it.
+    await expectSourceLine(dialog, 3)
   },
 }
 const searched: DiscoveryContext = {
@@ -1465,37 +1527,39 @@ export const OutsideWorkspace: Story = {
     },
   },
 }
+/** A call that waits for your approval, with `args` as its arguments. */
+const pendingApproval = (args: unknown): ActivityPage => ({
+  ...page,
+  detail: {
+    ...detail,
+    context: approvalContext,
+    request: {
+      kind: 'approval',
+      taskIntent: goal.intent,
+      actionable: true,
+      name: `${workspace}/approvals/mail`,
+      run,
+      invocation,
+      provider: call.provider,
+      providerLabel: 'Mail',
+      callPath: call.callPath,
+      arguments: JSON.stringify(args),
+      state: 'pending',
+      // A pending approval is still open, so its deadline is ahead of whoever views it.
+      deadline: new Date(Date.now() + 15 * 60_000).toISOString(),
+      approver: '',
+      decidedAt: null,
+      comment: null,
+    },
+  },
+})
 export const PendingApproval: Story = {
   beforeEach: freezeStoryClock,
   args: {
-    page: {
-      ...page,
-      detail: {
-        ...detail,
-        context: approvalContext,
-        request: {
-          kind: 'approval',
-          taskIntent: goal.intent,
-          actionable: true,
-          name: `${workspace}/approvals/mail`,
-          run,
-          invocation,
-          provider: call.provider,
-          providerLabel: 'Mail',
-          callPath: call.callPath,
-          arguments: JSON.stringify({
-            recipient: 'owner@example.com',
-            lines: Array.from({ length: 80 }, (_, i) => `Invoice ${i + 1}`),
-          }),
-          state: 'pending',
-          // A pending approval is still open, so its deadline is ahead of whoever views it.
-          deadline: minutesAfterStoryNow(15),
-          approver: '',
-          decidedAt: null,
-          comment: null,
-        },
-      },
-    },
+    page: pendingApproval({
+      recipient: 'owner@example.com',
+      lines: Array.from({ length: 80 }, (_, i) => `Invoice ${i + 1}`),
+    }),
   },
   globals: shortScreen,
   play: async ({ canvasElement, userEvent }) => {
@@ -1514,7 +1578,37 @@ export const PendingApproval: Story = {
     // The comment and the decision stay.
     await userEvent.click(within(dialog).getByText('Add a comment', { selector: 'summary' }))
     await expect(within(dialog).getByLabelText('Comment (optional)')).toBeVisible()
-    await expectPinnedFooter(dialog, ['Deny this call', 'Approve this call'])
+    // The Run's source shares the drawer, so the decision pins to the selected record's pane.
+    const selected = within(dialog).getByRole('region', { name: 'Selected record' })
+    await expectPinnedFooter(selected, ['Deny this call', 'Approve this call'])
+    // Above the decision, a fade marks the evidence still below, until the reader reaches it.
+    const scroller = scrollerIn(selected)
+    scroller.scrollTop = 0
+    await waitFor(() => expect(fadeBelow(scroller)).toBeGreaterThan(0))
+    scroller.scrollTop = scroller.scrollHeight
+    await waitFor(() => expect(fadeBelow(scroller)).toBe(0))
+    await expect(within(dialog).getByRole('region', { name: 'Accepted source' })).toBeVisible()
+    // The review's own header holds the drawer's one close control; no Run header sits above it.
+    const close = within(dialog).getByRole('button', { name: 'Close details' })
+    await expect(within(selected).getAllByRole('button', { name: 'Close details' })).toEqual([
+      close,
+    ])
+    const header = within(selected).getByRole('heading', { name: 'mail.send' }).closest('header')
+    await expect(header).toContainElement(close)
+  },
+}
+/** Evidence that fits its pane leaves no fade, and the decision shows whole. */
+export const ShortPendingApproval: Story = {
+  args: { page: pendingApproval('owner@example.com') },
+  play: async ({ canvasElement }) => {
+    // Storybook's own UI cannot resize its viewport, so this play needs the test runner.
+    if (!(await resizeViewport(1440, 1800))) return
+    const dialog = await openDrawer(canvasElement, 'Review action')
+    const selected = within(dialog).getByRole('region', { name: 'Selected record' })
+    const scroller = scrollerIn(selected)
+    await waitFor(() => expect(scroller.scrollHeight).toBeLessThanOrEqual(scroller.clientHeight))
+    await waitFor(() => expect(fadeBelow(scroller)).toBe(0))
+    await expectDecisionBelowEvidence(selected, ['Deny this call', 'Approve this call'])
   },
 }
 export const ResolvedApproval: Story = {
@@ -1581,7 +1675,8 @@ export const PendingConnectionFooter: Story = {
           state: 'pending',
           expiresAt: minutesAfterStoryNow(15),
         },
-        source: 'return null',
+        // The program whose call waits on this connection.
+        source: "return await coral.providers.linear.listIssues({ assignee: 'me' })",
         linkedFunctions: [],
         terminal: { kind: 'unavailable' },
       },
@@ -1654,10 +1749,10 @@ export const InvocationWithRunEvidence: Story = {
     await expect(failure).toHaveTextContent('program_execution_failed')
     await expect(drawer.getByRole('region', { name: 'Provider response' })).toBeVisible()
     await expect(drawer.getByText('program run: failed')).toBeVisible()
-    // The accepted source waits in a closed Details.
-    await expect(
-      drawer.getByText('Accepted program source', { selector: 'summary' }),
-    ).not.toBeVisible()
+    // The call leads; the Run's source shows in its own pane below, not repeated in Details.
+    await expect(drawer.queryByText('Accepted program source', { selector: 'summary' })).toBeNull()
+    const source = drawer.getByRole('region', { name: 'Accepted source' })
+    await expect(source.querySelector('[data-line="1"]')).toBeVisible()
     await expect(drawer.getByText('Details', { selector: 'summary' })).toBeVisible()
   },
 }
