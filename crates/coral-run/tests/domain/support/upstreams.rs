@@ -178,3 +178,95 @@ impl UpstreamSender for StopAwareUpstream {
         Err(crate::invocation::UpstreamSendError::Canceled)
     }
 }
+
+/// Holds every send until the test lets sends go, one at a time in send
+/// order, and reports a held send canceled once the Run's stop is requested,
+/// as the production sender does for a dispatch in flight. A canceled send
+/// leaves the queue, so a release never goes to it.
+pub(crate) struct SequencedUpstream {
+    pub(crate) sends: AtomicUsize,
+    held: Mutex<HeldSends>,
+    outcome: HttpOutcome,
+}
+
+/// The sends waiting to go on, in send order, and releases nobody has taken.
+#[derive(Default)]
+struct HeldSends {
+    waiting: std::collections::VecDeque<oneshot::Sender<()>>,
+    /// Releases granted while no send waited: the next sends take them.
+    banked: usize,
+    all_released: bool,
+}
+
+impl SequencedUpstream {
+    pub(crate) fn new(outcome: HttpOutcome) -> Arc<Self> {
+        Arc::new(Self {
+            sends: AtomicUsize::new(0),
+            held: Mutex::new(HeldSends::default()),
+            outcome,
+        })
+    }
+
+    /// Lets the earliest send still held go on; with none held, the next
+    /// send goes on at once.
+    pub(crate) fn release_one(&self) {
+        let mut held = self.held.lock().expect("held sends");
+        while let Some(send) = held.waiting.pop_front() {
+            // A send canceled by the Run's stop dropped its receiver.
+            if send.send(()).is_ok() {
+                return;
+            }
+        }
+        held.banked += 1;
+    }
+
+    /// Lets every send, held or later, go on.
+    pub(crate) fn release_all(&self) {
+        let mut held = self.held.lock().expect("held sends");
+        held.all_released = true;
+        for send in held.waiting.drain(..) {
+            let _canceled = send.send(());
+        }
+    }
+
+    /// Waits until `count` sends have reached the upstream.
+    pub(crate) async fn until_sent(&self, count: usize) {
+        wait_until_async_within(Duration::from_secs(10), async || {
+            self.sends.load(Ordering::SeqCst) >= count
+        })
+        .await;
+    }
+}
+
+#[async_trait]
+impl UpstreamSender for SequencedUpstream {
+    async fn send(
+        &self,
+        _dispatch: ReadyDispatch,
+        stop: Arc<ExecutionStop>,
+    ) -> Result<UpstreamOutcome, crate::invocation::UpstreamSendError> {
+        let released = {
+            let mut held = self.held.lock().expect("held sends");
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            if held.all_released {
+                None
+            } else if held.banked > 0 {
+                held.banked -= 1;
+                None
+            } else {
+                let (release, released) = oneshot::channel();
+                held.waiting.push_back(release);
+                Some(released)
+            }
+        };
+        if let Some(released) = released {
+            tokio::select! {
+                _released = released => {}
+                () = stop.requested() => {
+                    return Err(crate::invocation::UpstreamSendError::Canceled);
+                }
+            }
+        }
+        Ok(UpstreamOutcome::Http(self.outcome.clone()))
+    }
+}

@@ -17,9 +17,11 @@ use super::handle::Reply;
 /// commit, so this keeps a commit from holding the Run row for too long.
 pub(crate) const CHUNK_WORK_CAP: usize = 32;
 
-/// Invocations one chunk's Dispatch Fence decides at most: the Fan-out
-/// Limit's number. The fence reads its facts once whatever the batch holds;
-/// the bound keeps its one row statement and its decisions small.
+/// Invocations one chunk's Dispatch Fence decides at most; a batch this
+/// large closes its chunk. The fence reads its facts once whatever the batch
+/// holds; the bound keeps its one row statement and its decisions small.
+/// Every batched request holds a slot under the Fan-out Limit, so at the
+/// default limit a batch never exceeds this.
 pub(crate) const FENCE_BATCH_CAP: usize = 32;
 
 /// A database write that the owner runs inside a chunk's commit transaction,
