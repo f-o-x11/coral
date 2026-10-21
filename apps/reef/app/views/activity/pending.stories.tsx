@@ -5,9 +5,12 @@ import { PageLayout } from '@/wax/components/page-layout'
 import { trail } from '@/views/management/layout'
 import { Activity } from './activity'
 import { ActionReviewSession } from '../actions/review'
+import { freezeStoryClock, minutesAfterStoryNow } from './story-clock'
 import type { ActivityPage, ActivityRow, RequestDetail } from './types'
 
 const workspace = 'workspaces/finance'
+/** 15 minutes after the stories' fixed clock, so each deadline reads "Expires in 15 minutes". */
+const soon = minutesAfterStoryNow(15)
 const run: Extract<ActivityRow, { kind: 'run' }> = {
   kind: 'run',
   name: `${workspace}/runs/reminders`,
@@ -32,14 +35,14 @@ const run: Extract<ActivityRow, { kind: 'run' }> = {
         name: `${workspace}/approvals/mail`,
         callPath: 'coral.providers.mail.send',
         providerLabel: 'Mail',
-        deadline: '2030-09-22T09:15:00Z',
+        deadline: soon,
       },
       {
         kind: 'approval',
         name: `${workspace}/approvals/update`,
         callPath: 'coral.providers.billing.updateInvoice',
         providerLabel: 'Billing',
-        deadline: '2030-09-22T09:15:00Z',
+        deadline: soon,
       },
     ],
   },
@@ -54,9 +57,10 @@ const request: Extract<RequestDetail, { kind: 'approval' }> = {
   callPath: 'coral.providers.mail.send',
   arguments:
     '{"to":"owner@example.com","subject":"Invoice INV-4171 is overdue","body":"Your invoice is ready for review."}',
+  taskIntent: 'Chase overdue invoices for the Finance workspace',
   state: 'pending',
   actionable: true,
-  deadline: '2030-09-22T09:15:00Z',
+  deadline: soon,
   approver: '',
   decidedAt: null,
   comment: null,
@@ -82,10 +86,22 @@ const accountRun: typeof run = {
         name: `${workspace}/accountConnections/linear`,
         callPath: '',
         providerLabel: 'Linear',
-        deadline: '2030-09-22T09:15:00Z',
+        deadline: soon,
       },
     ],
   },
+}
+const accountCall = {
+  ...accountRun,
+  name: `${workspace}/invocations/linear`,
+  run: accountRun.name,
+  provider: `${workspace}/providers/linear`,
+  operation: 'listIssues',
+  callPath: 'coral.providers.linear.listIssues',
+  state: 'pending' as const,
+  outcome: 'unknown' as const,
+  dispatchedAt: null,
+  waitingNanos: '1',
 }
 const page: ActivityPage = {
   rows: [
@@ -160,11 +176,50 @@ function StoryActivity({ page: initial }: { page: ActivityPage }) {
             kind: 'run',
             run: selectedRun,
             request: exact,
-            source: 'return await coral.providers.mail.send({to: "owner@example.com"});',
+            source: [
+              'const invoices = await coral.providers.billing.listOverdue({ limit: 10 })',
+              'for (const invoice of invoices) {',
+              '  await coral.providers.mail.send({',
+              '    to: invoice.owner,',
+              '    subject: `Invoice ${invoice.id} is overdue`,',
+              "    body: 'Your invoice is ready for review.',",
+              '  })',
+              '}',
+            ].join('\n'),
             linkedFunctions: [],
             terminal: { kind: 'unavailable' },
           }
         : null),
+  }
+  // A call waiting on the shared Linear connection, reached on its own.
+  if (selected === accountCall.name) {
+    const connection = accountRun.actionPage!.actions[0]
+    value.selectedRow = { ...accountCall, kind: 'invocation' }
+    value.detail = {
+      kind: 'invocation',
+      invocation: accountCall,
+      arguments: '{"assignee":"me","limit":50}',
+      result: { kind: 'unknown' },
+      requests: [{ kind: 'account_connection', name: connection.name }],
+      request:
+        query.get('request') === connection.name
+          ? {
+              kind: 'account_connection',
+              name: connection.name,
+              provider: 'linear',
+              state: 'pending',
+              expiresAt: connection.deadline,
+            }
+          : null,
+      requestUnavailable: false,
+      context: {
+        kind: 'run',
+        run: accountRun,
+        source: "return await coral.providers.linear.listIssues({ assignee: 'me' })",
+        linkedFunctions: [],
+        terminal: { kind: 'unavailable' },
+      },
+    }
   }
   if (value.detail?.kind === 'run' && value.detail.request?.kind === 'approval') {
     const context = value.detail
@@ -218,6 +273,7 @@ const meta = {
   title: 'Activity/Pending actions',
   component: Activity,
   args: { page },
+  beforeEach: freezeStoryClock,
   parameters: { layout: 'fullscreen', chromatic: { viewports: [390, 1440] } },
   render: (args) => <StoryActivity page={args.page} />,
   decorators: [
@@ -345,9 +401,28 @@ export const LargeArguments: Story = {
           ...request,
           arguments: JSON.stringify({
             to: 'owner@example.com',
+            options: { trackOpens: false, replyTo: 'billing@example.com' },
             lines: Array.from({ length: 80 }, (_, i) => `Invoice ${i + 1}`),
           }),
         },
+      },
+    },
+  },
+}
+/** Arguments that are not a JSON object stay one exact JSON block. */
+export const NonObjectArguments: Story = {
+  args: {
+    page: {
+      ...page,
+      selected: run.name,
+      selectedRow: run,
+      detail: {
+        kind: 'run',
+        run,
+        source: 'return null;',
+        linkedFunctions: [],
+        terminal: { kind: 'unavailable' },
+        request: { ...request, arguments: '["owner@example.com","INV-4171"]' },
       },
     },
   },
@@ -402,8 +477,8 @@ export const ParallelCalls: Story = {
   },
 }
 /**
- * Scrolled arguments pass under the sticky review header. The play function
- * scrolls the heading behind the header so Chromatic records that the header
+ * Scrolled review content passes under the sticky review header. The play function
+ * scrolls an argument label behind the header so Chromatic records that the header
  * hides it in each theme.
  */
 const reviewHeaderOverArguments: Story = {
@@ -440,7 +515,8 @@ const reviewHeaderOverArguments: Story = {
     // The drawer slides in from off-screen, so measure only once it rests.
     const drawer = body.getByRole('dialog')
     await Promise.all(drawer.getAnimations().map((animation) => animation.finished))
-    const heading = within(review).getByRole('heading', { name: 'Arguments to review' })
+    // The field label sits above its tall value, so it scrolls fully under the header.
+    const heading = within(review).getByText('lines', { selector: 'dt' })
     const header = review.querySelector('header')!
     let port = heading.parentElement
     while (
@@ -453,7 +529,8 @@ const reviewHeaderOverArguments: Story = {
       port = port.parentElement
     if (!port) throw new Error('The review needs a scroll viewport')
     const scrollPort = port
-    // The header sticks only once the review scrolls, so measure again after each move.
+    // The header sticks only once the review scrolls, and the drawer animates in,
+    // so measure and probe again after each move.
     await waitFor(() => {
       const before = heading.getBoundingClientRect()
       const stuck = header.getBoundingClientRect()
@@ -462,10 +539,12 @@ const reviewHeaderOverArguments: Story = {
       const pinned = header.getBoundingClientRect()
       expect(behind.top).toBeGreaterThanOrEqual(pinned.top)
       expect(behind.bottom).toBeLessThanOrEqual(pinned.bottom)
+      const topmost = canvasElement.ownerDocument.elementFromPoint(
+        behind.left + behind.width / 2,
+        behind.top + behind.height / 2,
+      )
+      expect(header.contains(topmost)).toBe(true)
     })
-    const { left, top, width, height } = heading.getBoundingClientRect()
-    const topmost = canvasElement.ownerDocument.elementFromPoint(left + width / 2, top + height / 2)
-    await expect(header.contains(topmost)).toBe(true)
   },
 }
 export const ReviewHeaderOverArgumentsLight: Story = {
@@ -475,4 +554,64 @@ export const ReviewHeaderOverArgumentsLight: Story = {
 export const ReviewHeaderOverArgumentsDark: Story = {
   ...reviewHeaderOverArguments,
   globals: { backgrounds: { value: 'dark' } },
+}
+/** From a Run's action list, the keyboard reaches each card's review in order, and Enter opens
+ * that exact review. */
+export const ActionListKeyboard: Story = {
+  parameters: { initialEntry: `/workspaces/finance/activity?record=${run.name}` },
+  play: async ({ canvasElement, userEvent }) => {
+    const body = within(canvasElement.ownerDocument.body)
+    const nav = await body.findByRole('navigation', { name: 'Actions in this run' })
+    const [mail, update] = within(nav).getAllByRole('link', { name: /^Review / })
+    await expect(mail).toHaveAccessibleName('Review coral.providers.mail.send')
+    await expect(update).toHaveAccessibleName('Review coral.providers.billing.updateInvoice')
+    for (const time of nav.querySelectorAll('time'))
+      await expect(time).toHaveTextContent('Expires in 15 minutes')
+    mail.focus()
+    await userEvent.tab()
+    await expect(update).toHaveFocus()
+    await userEvent.keyboard('{Enter}')
+    // The second action's own review opens, with its own arguments.
+    await waitFor(() =>
+      expect(body.getByRole('button', { name: 'Approve this call' })).toBeVisible(),
+    )
+    await expect(body.getAllByText(/reminderSent/).length).toBeGreaterThan(0)
+    await expect(body.queryByRole('navigation', { name: 'Actions in this run' })).toBeNull()
+  },
+}
+/** A call waiting on a connection links to that connection on its Run, where Connect and
+ * Decline are; the whole card is the one link, reached by keyboard. */
+export const ConnectionFromCall: Story = {
+  parameters: {
+    initialEntry: `/workspaces/finance/activity?record=${accountCall.name}&request=${accountRun.actionPage!.actions[0].name}`,
+  },
+  globals: { viewport: { value: 'mobile1', isRotated: false } },
+  play: async ({ canvasElement, userEvent }) => {
+    const body = within(canvasElement.ownerDocument.body)
+    const card = await body.findByRole('region', { name: 'Account connection' })
+    await expect(card).toHaveTextContent('connection request: pending')
+    // One link to the request: the whole card, with no icon and no second "Inspect" row.
+    await expect(body.queryByRole('link', { name: 'Inspect account connection' })).toBeNull()
+    const open = within(card).getByRole('link', {
+      name: 'Open account connection request: pending',
+    })
+    await expect(card.firstElementChild).toBe(open)
+    await expect(open.querySelector('svg, button')).toBeNull()
+    const dialog = card.closest('[role="dialog"]') as HTMLElement
+    await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth)
+    // Tab reaches the card, and it shows that it has focus.
+    open.focus()
+    await expect(open).toHaveFocus()
+    await expect(getComputedStyle(open).outlineStyle).not.toBe('none')
+    await userEvent.keyboard('{Enter}')
+    // The connection opens on its Run, with the controls to act on it.
+    await waitFor(() =>
+      expect(
+        body.getByRole('heading', { level: 3, name: 'Connect your Linear account' }),
+      ).toBeVisible(),
+    )
+    await expect(body.getByRole('button', { name: 'Connect Linear' })).toBeVisible()
+    await expect(body.getByRole('button', { name: 'Decline' })).toBeVisible()
+    await expect(body.queryByRole('region', { name: 'Account connection' })).toBeNull()
+  },
 }

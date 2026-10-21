@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { useEffect, useState } from 'react'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import { markupRoute, renderRoute } from '@/test-support/route'
-import { Activity } from './activity'
+import { Activity, duration } from './activity'
 import { ActivityArchivedContext } from './live'
 import { ActionReviewSession } from '../actions/review'
 import { activityPage, approval, approvalRequest, run as waiting, workspace } from './fixtures'
@@ -74,7 +74,7 @@ it.each<[string, ActivityRow, string]>([
     { ...run, state: 'running', requiresAction: true },
     'running',
   ],
-  ['unknown attempt', { ...tool, outcome: 'unknown' }, 'unknown / incomplete'],
+  ['unknown attempt', { ...tool, outcome: 'unknown' }, 'result unknown'],
   [
     'accepted but unavailable execution',
     { ...tool, tool: 'exec', acceptedRun: run.name },
@@ -85,12 +85,13 @@ it.each<[string, ActivityRow, string]>([
     { ...operation, state: 'pending', outcome: 'unknown', requiresAction: true },
     'pending',
   ],
-  ['native upstream outcome, not inferred success', operation, 'upstream outcome'],
-  ['uncertain dispatch', { ...operation, outcome: 'indeterminate' }, 'indeterminate'],
+  ['a response received, not inferred success', operation, 'completed'],
+  ['uncertain dispatch', { ...operation, outcome: 'indeterminate' }, 'result unknown'],
+  ['a Coral failure', { ...operation, outcome: 'coral_failure' }, 'failed'],
   [
     'Run termination, not an upstream error',
     { ...operation, outcome: 'run_terminated' },
-    'run terminated',
+    'run ended',
   ],
 ])('marks %s with its exact accessible state', (_name, row, label) => {
   const markup = render(row)
@@ -98,6 +99,25 @@ it.each<[string, ActivityRow, string]>([
   expect(markup).toContain(`title="${label}"`)
   expect(markup).not.toContain('>STATE<')
 })
+
+// Catches: a log or emission row marked "diagnostic" or "retained", which says nothing about it.
+it.each(['program.logged', 'program.emitted', 'run.started'])(
+  'marks no state on a %s output row',
+  (eventKind) => {
+    const markup = render({
+      kind: 'output',
+      name: `${operation.run}/events/1`,
+      workspace: operation.workspace,
+      run: operation.run,
+      label: 'output #1',
+      startedAt: operation.startedAt,
+      eventKind,
+      agent: '',
+    })
+    expect(markup).not.toContain('aria-description=')
+    expect(markup).not.toMatch(/retained|diagnostic/)
+  },
+)
 
 it('marks only the operation as needing action, never its containing Run', () => {
   expect(render({ ...run, state: 'running', requiresAction: true })).not.toContain('needs action')
@@ -418,4 +438,18 @@ it('keeps a child that started after midnight under its parent and its day', () 
   expect(dayRecords('Mon 28 Sep 2026')).toEqual([goal.intent, 'you'])
   expect(headingLevel(goal.intent)).toBe('2')
   expect(screen.getByText('00:04:00')).toHaveAttribute('title', '2026-09-29 00:04:00 UTC')
+})
+
+// Catches: a duration that shows fractions of a second, or time that has not passed yet.
+it.each([
+  [0, '0s'],
+  [999_999_999, '0s'],
+  [1_000_000_000, '1s'],
+  [1_999_999_999, '1s'],
+  [59_999_999_999, '59s'],
+  [263_001_000_000, '4m 23s'],
+  [3_600_000_000_000, '1h 0m'],
+])('shows %d ns as whole time, %s', (nanos, text) => {
+  expect(duration(nanos)).toBe(text)
+  expect(duration(String(nanos))).toBe(text)
 })

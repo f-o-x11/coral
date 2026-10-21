@@ -44,6 +44,7 @@ import type {
   RunEvent,
   RunTerminal,
   RunFailureCode,
+  ActionPage,
 } from '@/views/activity/types'
 import {
   privateHeaders,
@@ -295,6 +296,35 @@ function runView(value: ActivityRun): ExecutionRow {
       : undefined,
   }
 }
+/**
+ * The later page of a Run's actions that a "More actions" link asks for, after `cursor`. Coral
+ * returns up to 100 actions a page. A page that fails leaves the first page, marked incomplete.
+ */
+async function laterRunActions(
+  api: ActivityApi,
+  run: string,
+  first: ActionPage,
+  cursor: string,
+  signal: AbortSignal | undefined,
+): Promise<ActionPage> {
+  try {
+    const value = await api.activity.inspectRun(
+      { name: run, pageSize: 1, actionAfter: cursor },
+      { signal },
+    )
+    const page = value.run?.actionPage
+    if (page)
+      return {
+        actions: page.actions.flatMap(actionSummaryView),
+        total: page.total.toString(),
+        next: page.nextAction,
+        after: cursor,
+      }
+  } catch (error) {
+    if (signal?.aborted) throw error
+  }
+  return { ...first, incomplete: true }
+}
 function actionSummaryView(value: ActivityActionSummary): ActionSummary[] {
   if (!value.request) return []
   const reference = requestReferenceView(value.request)
@@ -494,6 +524,14 @@ function unavailable(error: unknown) {
     (error.code === Code.NotFound || error.code === Code.PermissionDenied)
   )
 }
+/** A passing Coral fault. Only optional context may leave it out; sign-in, validation and a
+ * cancelled load still fail the read. */
+function transient(error: unknown) {
+  return (
+    error instanceof ConnectError &&
+    (error.code === Code.Unavailable || error.code === Code.Internal)
+  )
+}
 function invalid(message: string): never {
   throw new Response(message, { status: 400, headers: privateHeaders })
 }
@@ -611,7 +649,8 @@ async function selectedDetail(
           {
             name: run,
             pageSize: 1,
-            actionAfter: query.get('actionsAfter') ?? '',
+            // The first page of actions. A "More actions" link reads its later page on its own.
+            actionAfter: '',
             accountConnection: /^workspaces\/[^/]+\/accountConnections\/[^/]+$/.test(
               selectedRequest,
             )
@@ -630,7 +669,12 @@ async function selectedDetail(
           throw new ConnectError('unavailable', Code.NotFound)
         }
         const row = runView(value.run)
-        if (selectInitialRequest && !query.has('request') && name === run) {
+        // The Run's list, and a review opened from it, keep the page a "More actions" link named.
+        // A separate read, so a page that fails leaves the Run and its exact review readable.
+        const cursor = name === run ? query.get('actionsAfter') : null
+        if (row.actionPage && cursor)
+          row.actionPage = await laterRunActions(api, run, row.actionPage, cursor, signal)
+        if (selectInitialRequest && !query.has('request') && name === run && !cursor) {
           const first = row.actionPage?.actions[0]
           if (first?.kind === 'account_connection') {
             selectedRequest = first.name
@@ -709,7 +753,7 @@ async function selectedDetail(
             (detail.kind === 'invocation' && request.invocation !== detail.invocation.name)
           )
             throw new ConnectError('unavailable', Code.NotFound)
-          const review: RequestDetail = {
+          const review: Extract<RequestDetail, { kind: 'approval' }> = {
             kind: 'approval',
             actionable: request.actionable,
             name: request.name,
@@ -771,6 +815,19 @@ async function selectedDetail(
             if (context.detail?.kind !== 'run') throw new ConnectError('unavailable', Code.NotFound)
             detail.context = context.detail
             detail.request = review
+          }
+          // Approval review shows why the Task started. The Run names its Task only when the
+          // caller can see it; an unavailable Task, or a passing fault on this optional read,
+          // leaves the intent out, not the review.
+          const owner =
+            page.detail?.kind === 'invocation' ? page.detail.context?.run.task : undefined
+          if (owner) {
+            try {
+              const value = await api.activity.inspectTask({ name: owner, pageSize: 1 }, { signal })
+              if (value.task?.intent) review.taskIntent = value.task.intent
+            } catch (error) {
+              if (!unavailable(error) && !transient(error)) throw error
+            }
           }
         } else if (
           reference?.kind === 'account_connection' ||

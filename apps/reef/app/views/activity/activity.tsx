@@ -1,3 +1,4 @@
+import { duration } from './duration'
 import {
   createContext,
   memo,
@@ -39,6 +40,7 @@ import {
   type StopPosition,
 } from './navigation'
 import { ActivityDetail } from './detail'
+import { PanelClose } from './panel'
 import { ActivityConnectedContext, restoreFirst, useActivityArchived } from './live'
 import { PendingActions } from './pending'
 import { useUnsentComment } from '../actions/review'
@@ -47,6 +49,7 @@ import { ACTIVITY_CHILD_WINDOW, activityRowIdentity } from '@/lib/activity-live-
 import { activityDays, utcDay } from '@/lib/activity-list'
 import { visuallyHidden } from '@/wax/components/visually-hidden.css'
 import * as styles from './task-activity.css'
+import { invocationOutcomeLabels, resultUnknown } from './labels'
 
 export function rowLabel(row: ActivityRow): string {
   switch (row.kind) {
@@ -95,7 +98,7 @@ const runTones = {
   interrupted: 'warning',
   unknown: 'warning',
 } satisfies Record<RunState, RowStatus['tone']>
-function rowStatus(row: ActivityRow): RowStatus {
+function rowStatus(row: ActivityRow): RowStatus | undefined {
   switch (row.kind) {
     case 'task':
       return {
@@ -104,7 +107,7 @@ function rowStatus(row: ActivityRow): RowStatus {
         label: row.outcome,
       }
     case 'tool':
-      if (row.outcome === 'unknown') return { tone: 'warning', label: 'unknown / incomplete' }
+      if (row.outcome === 'unknown') return { tone: 'warning', label: resultUnknown }
       if (row.acceptedRun) return { tone: 'neutral', label: 'accepted · run unavailable' }
       return {
         tone:
@@ -126,8 +129,8 @@ function rowStatus(row: ActivityRow): RowStatus {
           tone: row.requiresAction || row.state === 'unknown' ? 'warning' : 'neutral',
           label: row.state,
         }
-      // An upstream outcome stays neutral whether the Program received it or was rejected with it
-      // as an Operation Error.
+      // A complete response stays neutral whether the Program received it or was rejected with it
+      // as an Operation Error: the row holds no response to tell, so it says only that one came.
       return {
         tone:
           row.outcome === 'coral_failure'
@@ -135,21 +138,12 @@ function rowStatus(row: ActivityRow): RowStatus {
             : row.outcome === 'indeterminate' || row.outcome === 'unknown'
               ? 'warning'
               : 'neutral',
-        label: row.outcome.replaceAll('_', ' '),
+        label: invocationOutcomeLabels[row.outcome],
       }
     case 'output':
-      return {
-        tone: 'neutral',
-        label: row.eventKind === 'program.logged' ? 'diagnostic' : 'retained',
-      }
+      // Its icon and label name it; a state would say nothing more.
+      return undefined
   }
-}
-export function duration(nanos: string | number) {
-  const ms = Number(nanos) / 1_000_000
-  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ${Math.floor(ms / 1000) % 60}s`
-  return `${Math.floor(ms / 3_600_000)}h ${Math.floor(ms / 60_000) % 60}m`
 }
 function rowDuration(row: ActivityRow) {
   if ('durationNanos' in row)
@@ -491,6 +485,16 @@ export function Activity({
     setShown({ page, record: shownRecord })
   const detail = selected ? { page, record: shownRecord } : shown
   const detailPage = detail.page
+  // Every detail panel names its own record, so it replaces the rail's generic header.
+  const ownHeader = !detailPage.unavailable && Boolean(detailPage.detail)
+  // A request review narrows the rail to one decision; name it apart from a record glimpse.
+  const reviewingAction =
+    ownHeader &&
+    ((detailPage.detail?.kind === 'invocation' &&
+      detailPage.detail.request?.kind === 'approval' &&
+      Boolean(detailPage.detail.context)) ||
+      (detailPage.detail?.kind === 'run' &&
+        detailPage.detail.request?.kind === 'account_connection'))
   const unsent = useUnsentComment()
   // The token of the rail's latest pick or close. A pending navigation with this
   // token is the rail's own and has no history entry yet.
@@ -958,21 +962,25 @@ export function Activity({
                 // Closing returns focus to the table, where the cursor shows the record.
                 finalFocus={() => tableRef.current ?? true}
               >
-                <Dialog.Header>
-                  <Dialog.Title>
-                    {(detailPage.detail?.kind === 'invocation' &&
-                      detailPage.detail.request?.kind === 'approval') ||
-                    (detailPage.detail?.kind === 'run' &&
-                      detailPage.detail.request?.kind === 'account_connection')
-                      ? 'Review action'
-                      : 'Activity details'}
+                {/* Each detail panel heads the rail with the record it names. */}
+                {ownHeader ? (
+                  <Dialog.Title visuallyHidden>
+                    {reviewingAction ? 'Review action' : 'Activity details'}
                   </Dialog.Title>
-                  <Dialog.Close ariaLabel="Close details" />
-                </Dialog.Header>
+                ) : (
+                  <Dialog.Header>
+                    <Dialog.Title>Activity details</Dialog.Title>
+                    <Dialog.Close ariaLabel="Close details" />
+                  </Dialog.Header>
+                )}
                 {detailPage.unavailable ? (
                   <Typography.Body>This history is unavailable.</Typography.Body>
                 ) : (
-                  <ActivityDetail key={detail.record} page={detailPage} />
+                  <PanelClose
+                    value={ownHeader ? <Dialog.Close ariaLabel="Close details" inline /> : null}
+                  >
+                    <ActivityDetail key={detail.record} page={detailPage} />
+                  </PanelClose>
                 )}
                 {outside &&
                   page.detail?.kind !== 'run' &&
@@ -994,3 +1002,5 @@ export function Activity({
     </RowActionsContext>
   )
 }
+
+export { duration } from './duration'

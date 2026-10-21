@@ -165,6 +165,10 @@ export interface ActionPage {
   actions: ActionSummary[]
   total: string
   next: string
+  /** The cursor a later page starts after; absent on the first page. */
+  after?: string
+  /** The later page a link asked for failed, so the list holds the first page instead. */
+  incomplete?: boolean
 }
 /** One pending request, with a Run that waits on it as context. */
 export interface PendingAction {
@@ -186,6 +190,8 @@ export type RequestDetail =
       provider: string
       providerLabel?: string
       approverLabel?: string
+      /** Intent of the Task that owns the Run; absent when that Task is unavailable. */
+      taskIntent?: string
       callPath: string
       arguments: string
       state: string
