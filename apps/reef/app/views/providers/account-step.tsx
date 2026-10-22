@@ -11,6 +11,7 @@ import {
 } from '@/lib/provider-publication-attempt/model'
 import { Banner, Button, Inputs, Radio, Typography } from '@/wax/components'
 import * as Dialog from '@/wax/components/dialog'
+import { DocumentSubmitButton } from '@/components/document-submit-button'
 import { Fields } from '@/views/management/forms'
 import { accountLabels, useAccountAudience } from './account-labels'
 import { CredentialFields } from '@/views/management/credential-fields'
@@ -311,13 +312,9 @@ export function AccountStep({
                 >
                   Cancel
                 </Button.TextButton>
-                <Button.TextButton type="submit" form={secretFormId} disabled={pending}>
-                  {pending
-                    ? 'Saving…'
-                    : shared
-                      ? 'Save and share the account'
-                      : 'Save your account'}
-                </Button.TextButton>
+                <DocumentSubmitButton form={secretFormId} disabled={pending}>
+                  {shared ? 'Save and share the account' : 'Save your account'}
+                </DocumentSubmitButton>
               </Dialog.Actions>
             </Dialog.Popup>
           </Dialog.Portal>
@@ -327,7 +324,7 @@ export function AccountStep({
           <Dialog.Trigger
             render={<Button.Container variant="primary" disabled={pending || unstartable} />}
           >
-            <Button.Text>{signInLabel(setup, pending)}</Button.Text>
+            <Button.Text>{signInLabel(setup)}</Button.Text>
           </Dialog.Trigger>
           <Dialog.Portal>
             <Dialog.Backdrop />
@@ -345,17 +342,17 @@ export function AccountStep({
                 </Button.TextButton>
                 {/* The step's own form is submitted from here; the portal
                         puts this button outside it, so it names the form. */}
-                <Button.TextButton type="submit" form={formId} disabled={pending}>
-                  {pending ? 'Starting…' : SIGN_IN_ACTION}
-                </Button.TextButton>
+                <DocumentSubmitButton form={formId} disabled={pending}>
+                  {SIGN_IN_ACTION}
+                </DocumentSubmitButton>
               </Dialog.Actions>
             </Dialog.Popup>
           </Dialog.Portal>
         </Dialog.Root>
       ) : (
-        <Button.TextButton type="submit" form={formId} disabled={pending || unstartable}>
-          {signingIn && oauth ? signInLabel(setup, pending) : pending ? 'Saving…' : 'Next'}
-        </Button.TextButton>
+        <DocumentSubmitButton form={formId} disabled={pending || unstartable}>
+          {signingIn && oauth ? signInLabel(setup) : 'Next'}
+        </DocumentSubmitButton>
       )}
     </>
   ) : (
