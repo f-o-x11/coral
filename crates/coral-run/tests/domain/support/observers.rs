@@ -86,8 +86,8 @@ impl BlockingGate {
     }
 }
 
-/// Holds the Run Owner's first chunk commit (after its start mark) until
-/// released; every later commit passes.
+/// Holds the first chunk commit (a Run Owner's after its start mark, or a
+/// recovered owner's one chunk) until released; every later commit passes.
 pub(crate) struct CommitGate(BlockingGate);
 
 impl CommitGate {

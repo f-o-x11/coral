@@ -19,9 +19,9 @@ pub(crate) struct RunRecord {
     pub(crate) shutdown_grace_nanos: i64,
     /// The Run Ledger head: the number of chunk commits since acceptance.
     pub(crate) chunk_sequence: u64,
-    /// The last Event sequence on the Run as of a read snapshot, `0` before
-    /// `run.started`. `None` on a Run read under `hold_run`, which does not
-    /// read the Event rows: the chunk commit numbers its Events itself.
+    /// The last Event sequence on the Run as of the read, `0` before
+    /// `run.started`. Read beside the row; the chunk commit numbers its
+    /// Events itself and never from this.
     pub(crate) last_event_sequence: Option<u64>,
     pub(crate) accumulated_output_bytes: usize,
     pub(crate) terminal_outcome: Option<RunTerminalOutcome>,
@@ -80,6 +80,14 @@ impl RunRecord {
         self.execution_started_at_unix_nanos.is_some()
     }
 
+    /// The claim the Run row holds: its execution claim, or the worker claim
+    /// of a Run that has not started; `None` for a Run with no claim.
+    pub(crate) fn held_claim(&self) -> Option<&str> {
+        self.execution_claim_id
+            .as_deref()
+            .or(self.worker_claim_id.as_deref())
+    }
+
     /// A termination intent no Principal asked for: the deadline, an
     /// interruption, or the memory limit. A cancellation's intent is the Run
     /// Owner's to apply.
@@ -123,12 +131,6 @@ impl RequestedTermination {
             },
             requester,
         })
-    }
-
-    /// Whether recording this intent releases the worker claim: an
-    /// interruption does, the Run having no live owner.
-    pub(crate) fn releases_worker_claim(&self) -> bool {
-        self.termination.kind == RunTerminationKind::Interrupted
     }
 }
 

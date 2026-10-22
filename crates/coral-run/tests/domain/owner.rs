@@ -719,7 +719,7 @@ fn apply_decides_bursts_budgets_the_applied_cap_and_a_lost_claim_in_memory() {
             39,
         );
         assert!(
-            matches!(effects.as_slice(), [Effect::Retire { ended: false }]),
+            matches!(effects.as_slice(), [Effect::Retire]),
             "{effects:?}"
         );
         assert_eq!(state.phase(), Phase::Retired);
@@ -840,7 +840,7 @@ fn apply_decides_bursts_budgets_the_applied_cap_and_a_lost_claim_in_memory() {
         assert_eq!(state.phase(), Phase::Completing);
         assert!(matches!(
             apply_without_tick(&mut state, Message::Completed(Ok(None)), 63).as_slice(),
-            [Effect::Retire { ended: true }]
+            [Effect::Retire]
         ));
     }
 
@@ -902,7 +902,7 @@ fn apply_decides_bursts_budgets_the_applied_cap_and_a_lost_claim_in_memory() {
         assert!(late_work.lock().expect("settle").is_none());
         assert!(matches!(
             apply_without_tick(&mut state, refused(), 84).as_slice(),
-            [Effect::Retire { ended: false }]
+            [Effect::Retire]
         ));
         assert_eq!(state.phase(), Phase::Retired);
     }
@@ -964,7 +964,7 @@ fn apply_decides_bursts_budgets_the_applied_cap_and_a_lost_claim_in_memory() {
         );
         assert!(matches!(
             apply_without_tick(&mut state, Message::SettleAttempted(Ok(true)), 99).as_slice(),
-            [Effect::Retire { ended: true }]
+            [Effect::Retire]
         ));
         assert_eq!(state.phase(), Phase::Retired);
         let (effects, mut refused, refused_work) = result(&mut state, 10, 100);
@@ -1100,7 +1100,7 @@ fn apply_decides_bursts_budgets_the_applied_cap_and_a_lost_claim_in_memory() {
         ));
         assert!(matches!(
             apply_without_tick(&mut state, Message::Interrupted(Ok(())), now + 4).as_slice(),
-            [Effect::Retire { ended: true }]
+            [Effect::Retire]
         ));
         assert_eq!(state.phase(), Phase::Retired);
     }
@@ -1171,7 +1171,7 @@ fn apply_decides_bursts_budgets_the_applied_cap_and_a_lost_claim_in_memory() {
             304,
         );
         assert!(
-            matches!(effects.as_slice(), [Effect::Retire { ended: false }]),
+            matches!(effects.as_slice(), [Effect::Retire]),
             "{effects:?}"
         );
     }
@@ -2126,10 +2126,7 @@ async fn apply_records_outside_requests_once_in_mailbox_order_and_applies_a_canc
             Message::Completed(Ok(None)),
             5,
         ));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Retire { ended: true }]
-        ));
+        assert!(matches!(effects.as_slice(), [Effect::Retire]));
         assert!(matches!(
             decided(&mut during),
             Some(Ok(DecisionAnswer::FromRecord))
@@ -2813,5 +2810,50 @@ async fn apply_wakes_parked_invocations_on_their_own_evidence_and_prechecks_the_
         assert_eq!(state.parked_invocations(), 0);
         let effects = apply_without_tick(&mut state, Message::Timer(Timer::Precheck), 5);
         assert!(effects.is_empty(), "{effects:?}");
+    }
+}
+
+/// A recovered owner gathers the Approval Request timers the sweep queued,
+/// in order, and its end writes them in one chunk. The write's answer, or a
+/// stop (the Shutdown Drain is out) whether the chunk is queued or in
+/// flight, retires it.
+#[test]
+fn a_recovered_owner_writes_its_queued_expiries_in_one_chunk_and_retires() {
+    let (first, second) = (approval_id(), approval_id());
+    let mut state = OwnerState::recovered(LIMITS, 1);
+    let mut effects = Vec::new();
+    for message in [
+        Message::Timer(Timer::Approval(first.clone())),
+        Message::Timer(Timer::Approval(second.clone())),
+        Message::Recover,
+    ] {
+        effects.extend(apply_without_tick(&mut state, message, 3));
+    }
+    let [Effect::Recover { expired }] = effects.as_slice() else {
+        panic!("one chunk, nothing else: {effects:?}");
+    };
+    assert_eq!(expired, &[first, second]);
+    assert!(apply_without_tick(&mut state, Message::Drained, 4).is_empty());
+    assert!(matches!(
+        apply_without_tick(
+            &mut state,
+            Message::Interrupted(Err(CommitRejection::ClaimMismatch)),
+            5
+        )
+        .as_slice(),
+        [Effect::Retire]
+    ));
+    assert_eq!(state.phase(), Phase::Retired);
+    for writing in [false, true] {
+        let mut state = OwnerState::recovered(LIMITS, 1);
+        if writing {
+            apply_without_tick(&mut state, Message::Recover, 3);
+        }
+        let effects = apply_without_tick(&mut state, Message::Stop, 4);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Retire]),
+            "writing {writing}: {effects:?}"
+        );
+        assert_eq!(state.phase(), Phase::Retired);
     }
 }

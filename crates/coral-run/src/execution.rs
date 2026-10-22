@@ -251,6 +251,18 @@ impl ExecutionPolicy {
         duration_nanos(self.claim_lease / 2)
     }
 
+    /// How often the expired-lease sweep runs: half a lease.
+    pub(crate) fn sweep_interval(self) -> Duration {
+        self.claim_lease / 2
+    }
+
+    /// How long the end of the Shutdown Drain waits for the owners it
+    /// interrupts to record that: the shutdown grace their dispatches in
+    /// flight get, and the settle's last attempt.
+    pub(crate) fn commit_grace(self) -> Duration {
+        self.shutdown_grace + crate::termination::SETTLE_MARGIN
+    }
+
     /// How long an Approval Request waits for a decision at most.
     pub(crate) fn approval_wait_nanos(self) -> i64 {
         duration_nanos(self.approval_wait)

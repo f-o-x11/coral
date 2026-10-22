@@ -55,12 +55,12 @@ pub(crate) use chunk::ChunkWork;
 #[cfg(test)]
 pub(crate) use chunk::{CHUNK_WORK_CAP, ChunkBuildView, FENCE_BATCH_CAP};
 pub(crate) use handle::{
-    Check, DecisionAnswer, DecisionRequest, OwnerHandle, Owners, ParkedWait, RequestKey,
-    StartedExecution,
+    Check, DecisionAnswer, DecisionRequest, Message, OwnerHandle, Owners, ParkedWait, RequestKey,
+    StartedExecution, Timer,
 };
 #[cfg(test)]
-pub(crate) use handle::{CommitRejection, Message, Reply, Timer};
-pub(crate) use host::host;
+pub(crate) use handle::{CommitRejection, Reply};
+pub(crate) use host::{OwnerStart, host};
 #[cfg(test)]
 pub(crate) use state::{Effect, OwnerLimits, OwnerState, Phase, apply};
 
@@ -71,9 +71,10 @@ pub(crate) use state::{Effect, OwnerLimits, OwnerState, Phase, apply};
 /// # Errors
 ///
 /// [`Error::OwnedElsewhere`] for a nonterminal Run with no live owner here:
-/// its lease is held by another process, or lapsed and not yet swept. The
-/// Run is read again first, since an owner retires once its Run is
-/// terminal.
+/// its lease is held by another process, or lapsed and not yet swept (the
+/// sweep ends it within one lease and one sweep), or a recovered owner here
+/// is ending it and its chunk has not landed. The Run is read again first,
+/// since an owner retires once its Run is terminal.
 pub(crate) async fn local_owner(
     owners: &Owners,
     database: &Database,
@@ -83,12 +84,10 @@ pub(crate) async fn local_owner(
     if run.state.is_terminal() {
         return Ok(None);
     }
-    let owner = run
-        .execution_claim_id
-        .as_deref()
-        .or(run.worker_claim_id.as_deref())
-        .and_then(|claim_id| owners.find(&run.id, claim_id));
-    if let Some(owner) = owner {
+    if let Some(owner) = run
+        .held_claim()
+        .and_then(|claim_id| owners.find(&run.id, claim_id))
+    {
         return Ok(Some(owner));
     }
     let current = run_repository::find_exact(database, workspace_id, &run.id).await?;
