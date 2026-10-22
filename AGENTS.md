@@ -59,14 +59,32 @@
   creators.
 - A nonterminal Run's row and Events are written only through its Run
   Owner: the Program paths (Emissions, Logs, Invocation admission, held
-  rechecks, the Dispatch Fence, Invocation completion) and the outside
-  requests (an approval decision, a cancellation, the deadline) alike. An
-  Event is applied in owner memory, a row write is a `ChunkWork` that joins
-  the owner's chunk commit, and an intent (a cancellation, the deadline)
-  rides a chunk's head update or the owner's terminal write; every chunk
-  commit asserts the head the owner tracks in memory. Do not open a transaction that holds the Run row
-  from any of these paths, and do not write a nonterminal Run's row from
-  outside its owner; recovery's explicit pass is the one outside writer.
+  rechecks, the Dispatch Fence, Invocation completion), the outside
+  requests (an approval decision, a cancellation) and the owner's timers
+  (the Run deadline, each Approval Request's and connection request's
+  deadline) alike. An Event is applied in owner memory, a row write is a
+  `ChunkWork` that joins the owner's chunk commit, and an intent (a
+  cancellation, the deadline) rides a chunk's head update or the owner's
+  terminal write; every chunk commit asserts the head the owner tracks in
+  memory. A timer is armed as an effect and fires as a message into the
+  owner's mailbox, so the clock never decides state outside the owner (ADR
+  0018): a Run's timeout and an Approval Request's expiry are decided in the
+  owner's pure `apply`, in mailbox order (when the timer fires, or first
+  when a decision or a cancel applied before it finds the deadline passed),
+  the owner's own writes read the
+  clock only for their own sample (the start mark and the terminal write
+  date a timeout they find passed; the Dispatch Fence judges an approved
+  request's deadline at dispatch, contract line 3, and records no expiry),
+  and no chunk commit is predicated on the clock (contract line 5). Nothing
+  outside the owner compares `now` with those deadlines to write TimedOut
+  or Expired: readers show the recorded state beside the deadline, and
+  recovery's explicit pass is the one outside writer. A connection request
+  is Account-owned and shared across Runs: the Account module records its
+  expiry when a holder reads it, and the owner's timer only wakes the
+  Invocations parked on it. Do not open a transaction that holds the Run
+  row from any of
+  these paths, and do not write a nonterminal Run's row from outside its
+  owner; recovery's explicit pass is the one outside writer.
   [ADR 0018](docs/adr/0018-run-owner-coordinates-each-run.md) has the
   request model (requests keyed by the entity they decide, the first wins).
 - A Run Owner's write ends on the database's answer, never on the clock: an

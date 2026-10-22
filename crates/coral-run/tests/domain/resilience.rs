@@ -199,10 +199,11 @@ async fn a_definite_database_rejection_stops_the_owner_without_a_retry() {
     );
 }
 
-/// The deadline task is recovery's trigger once the owner is gone: an owner
-/// whose settle of the interruption it recorded fails retires and leaves
-/// its Run `running`, and the deadline still ends the Run, with no explicit
-/// recovery pass.
+/// An owner whose settle of the interruption it recorded fails retires and
+/// leaves its Run `running` with the termination recorded: no timer of its
+/// own fires after it retired, and its supervisor runs recovery's pass at
+/// the Run deadline, so the Run still ends there with no explicit pass
+/// (slice 9's expired-lease sweep takes that over).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_run_whose_owner_retired_on_a_failed_settle_is_ended_by_its_deadline() {
     let (engine, gates) = BurstEngine::new(vec!["\"one\"".to_string()]);
@@ -211,10 +212,9 @@ async fn a_run_whose_owner_retired_on_a_failed_settle_is_ended_by_its_deadline()
     let (workspace_id, principal) = fixture
         .user_scope("user:deadline-after-retire", "Survive the database")
         .await;
-    // The deadline task sleeps this long on the host clock; the owner must
-    // have retired, and the fault be gone, well before it fires.
+    // The supervisor sleeps this long on the host clock from the launch; the
+    // owner must have retired, and the fault be gone, well before it fires.
     let run_timeout = Duration::from_secs(3);
-    let scheduled = std::time::Instant::now();
     let accepted = fixture
         .runs
         .start(
@@ -228,6 +228,9 @@ async fn a_run_whose_owner_retired_on_a_failed_settle_is_ended_by_its_deadline()
         )
         .await
         .expect("accept the Program");
+    // The launch, which anchors the supervisor's sleep, happened inside
+    // `start`; admission before it does not count against the window.
+    let scheduled = std::time::Instant::now();
     let run_id = accepted.run_id().clone();
     wait_until_started(&fixture, &workspace_id, &run_id).await;
     let before = fixture.run_record(&workspace_id, &run_id).await;
@@ -266,7 +269,7 @@ async fn a_run_whose_owner_retired_on_a_failed_settle_is_ended_by_its_deadline()
         .store(before.deadline_at_unix_nanos + 1, Ordering::SeqCst);
     assert!(
         scheduled.elapsed() < run_timeout / 2,
-        "the fault must be gone before the deadline task fires; this host took {:?}",
+        "the fault must be gone before the supervisor's pass runs; this host took {:?}",
         scheduled.elapsed()
     );
     wait_until_async_within(run_timeout + Duration::from_secs(3), async || {

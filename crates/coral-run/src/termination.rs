@@ -115,8 +115,12 @@ impl RunModule {
         }
     }
 
-    /// Recovery's pass over one Run, as the sweep and the deadline task of a
-    /// retired owner run it.
+    /// Recovery's pass over one Run, as [`Self::recover`] runs it: the one
+    /// writer of a nonterminal Run outside its owner. Explicit host
+    /// maintenance until slice 9's expired-lease sweep: it reaches a Run
+    /// whose owner retired, and a Run past its deadline or lease whose
+    /// owner is still live here, which it stops and waits for before it
+    /// settles.
     pub(crate) async fn recover_run(
         &self,
         workspace_id: &WorkspaceId,
