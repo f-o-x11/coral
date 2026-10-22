@@ -9,7 +9,7 @@ import { OrganizationMembersPage } from './organization-members-page'
 import { OrganizationWorkspacesPage } from './organization-workspaces-page'
 import { WorkspaceMembersPage, type WorkspaceMembersPageProps } from './workspace-members-page'
 import { Activity } from '@/views/activity/activity'
-import type { ActivityRow } from '@/views/activity/types'
+import type { ActivityRow, ActivityViewProps } from '@/views/activity/types'
 import { ActivitySummary } from '@/views/activity/summary/summary'
 import { WorkspaceOverview, type WorkspaceOverviewProps } from './workspace-overview'
 
@@ -74,7 +74,11 @@ const ownMembership = {
   etag: 'self',
 }
 // The overview and agent routes pass no endpoint: their quick start cards show the setup.
-const activityPage = (rows: ActivityRow[], owner: string | null = null) => (
+const activityPage = (
+  rows: ActivityRow[],
+  owner: string | null = null,
+  more?: ActivityViewProps['more'],
+) => (
   <Activity
     page={{
       rows,
@@ -91,9 +95,15 @@ const activityPage = (rows: ActivityRow[], owner: string | null = null) => (
       selectedRow: null,
       listPath: workspace.path,
     }}
+    more={more}
   />
 )
 const emptyAgentActivity = activityPage([], agent.name)
+const emptyAgentGlimpse = activityPage([], agent.name, {
+  to: `${agent.path}?view=activity`,
+  label: 'View all activity',
+  roots: 3,
+})
 const overview: WorkspaceOverviewProps = {
   workspace,
   agents: [agent, blockedAgent],
@@ -440,6 +450,34 @@ const agentProviders: import('./agent-providers').AgentProviderView[] = [
     blockers: ['Provider disabled', 'Connect an account for this agent'],
   },
 ]
+const activityIntents = [
+  'Reconcile nightly invoices',
+  'Triage incoming support requests',
+  'Update the release readiness report',
+  'Check overdue customer follow-ups',
+  'Summarize provider health signals',
+  'Review unresolved approval requests',
+]
+const busyAgentActivityRows: ActivityRow[] = Array.from({ length: 36 }, (_, index) => {
+  const ended = Date.UTC(2026, 8, 22, 9) - index * 3_600_000
+  return {
+    kind: 'task' as const,
+    name: `${workspace.name}/tasks/review-${index + 1}`,
+    workspace: workspace.name,
+    agent: agent.name,
+    actor: agent.displayName,
+    intent: `${activityIntents[index % activityIntents.length]} · batch ${index + 1}`,
+    outcome: index % 7 === 0 ? 'failure' : 'success',
+    startedAt: new Date(ended - 90_000).toISOString(),
+    endedAt: new Date(ended).toISOString(),
+  }
+})
+const busyAgentActivity = activityPage(busyAgentActivityRows, agent.name)
+const agentActivityGlimpse = activityPage(busyAgentActivityRows, agent.name, {
+  to: `${agent.path}?view=activity`,
+  label: 'View all activity',
+  roots: 3,
+})
 export const AgentActivity: Story = {
   render: () => (
     <AgentActivityPage
@@ -447,22 +485,8 @@ export const AgentActivity: Story = {
       agent={agent}
       providers={agentProviders}
       form={form}
-      activity={activityPage(
-        [
-          {
-            kind: 'task' as const,
-            name: `${workspace.name}/tasks/nightly`,
-            workspace: workspace.name,
-            agent: agent.name,
-            actor: agent.displayName,
-            intent: 'Reconcile nightly invoices',
-            outcome: 'success',
-            startedAt: '2026-09-22T09:00:00.000Z',
-            endedAt: '2026-09-22T09:01:00.000Z',
-          },
-        ],
-        agent.name,
-      )}
+      activity={busyAgentActivity}
+      recentActivity={agentActivityGlimpse}
     />
   ),
   parameters: { initialEntry: agent.path },
@@ -476,6 +500,65 @@ export const AgentActivity: Story = {
       await expect(canvas.queryByRole('button', { name })).toBeNull()
   },
 }
+// Catches: a short viewport trapping Recent activity below the visible page.
+export const AgentActivityShortViewport: Story = {
+  ...AgentActivity,
+  globals: { viewport: { value: 'mobile1', isRotated: false } },
+  play: async ({ canvas }) => {
+    const activity = canvas.getByRole('table', { name: 'Activity records' })
+    activity.scrollIntoView({ block: 'end' })
+    await waitFor(() =>
+      expect(activity.getBoundingClientRect().bottom).toBeLessThanOrEqual(window.innerHeight + 1),
+    )
+  },
+}
+export const AgentFullActivity: Story = {
+  ...AgentActivity,
+  parameters: { initialEntry: `${agent.path}?view=activity` },
+  // The app shell bounds the split page; the story needs the same height so
+  // Activity scrolls its records instead of growing with them.
+  decorators: [
+    (Story) => (
+      <div style={{ height: '100vh' }}>
+        <Story />
+      </div>
+    ),
+  ],
+  play: async ({ canvas }) => {
+    await expect(canvas.getByRole('heading', { name: 'Activity' })).toBeVisible()
+    await expect(canvas.getByRole('link', { name: 'Back to agent' })).toHaveAttribute(
+      'href',
+      agent.path,
+    )
+  },
+}
+// Catches: a link into the agent's Activity list opening the dashboard instead.
+export const AgentActivityAfterRecord: Story = {
+  ...AgentFullActivity,
+  parameters: { initialEntry: `${agent.path}?anchor=x&tree=1` },
+  play: async ({ canvas }) => {
+    await expect(canvas.getByRole('link', { name: 'Back to agent' })).toBeVisible()
+    await expect(canvas.queryByRole('heading', { name: 'Recent activity' })).toBeNull()
+  },
+}
+// Catches: an agent with no provider requirements showing an empty Accounts card.
+export const AgentWithoutAccounts: Story = {
+  render: () => (
+    <AgentActivityPage
+      workspace={workspace}
+      agent={agent}
+      providers={[]}
+      form={form}
+      activity={busyAgentActivity}
+      recentActivity={agentActivityGlimpse}
+    />
+  ),
+  parameters: { initialEntry: agent.path },
+  play: async ({ canvas }) => {
+    await expect(canvas.queryByRole('region', { name: 'Accounts' })).toBeNull()
+    await expect(canvas.getByRole('heading', { name: 'Recent activity' })).toBeVisible()
+  },
+}
 // Catches: a client's setup losing the workspace endpoint or the key placeholder.
 export const NewAgentActivity: Story = {
   render: () => (
@@ -485,6 +568,7 @@ export const NewAgentActivity: Story = {
       providers={agentProviders}
       form={form}
       activity={emptyAgentActivity}
+      recentActivity={emptyAgentGlimpse}
       idle
     />
   ),
@@ -543,6 +627,7 @@ export const AgentAccountsUnavailable: Story = {
       providers={null}
       form={form}
       activity={emptyAgentActivity}
+      recentActivity={emptyAgentGlimpse}
       idle
     />
   ),
@@ -565,6 +650,7 @@ export const ArchivedAgentActivity: Story = {
       providers={agentProviders}
       form={form}
       activity={emptyAgentActivity}
+      recentActivity={emptyAgentGlimpse}
       idle
     />
   ),
@@ -575,6 +661,14 @@ export const ArchivedAgentActivity: Story = {
     await expect(
       accounts.queryByRole('button', { name: /^(Connect|Reconnect) account for/ }),
     ).toBeNull()
+  },
+}
+// Catches: the complete Activity of an archived workspace's agent hiding the archive.
+export const ArchivedAgentFullActivity: Story = {
+  ...ArchivedAgentActivity,
+  parameters: { initialEntry: `${agent.path}?view=activity` },
+  play: async ({ canvas }) => {
+    await expect(canvas.getByText('This workspace is archived')).toBeVisible()
   },
 }
 export const AgentSettings: Story = {
