@@ -34,6 +34,7 @@ import {
   liveRun,
   liveStep,
   liveTarget,
+  orderedRecordPosition,
   recordParents,
   resolveStop,
   revealHref,
@@ -1331,6 +1332,7 @@ export function Activity({
                     context={runContext}
                     locatable={detailPage.detail?.kind === 'run'}
                     selectedRow={detailPage.selectedRow}
+                    position={orderedRecordPosition(detailPage, detailPage.selectedRow)}
                     close={railControls}
                   >
                     <ActivityDetail key={detail.record} page={detailPage} sourceShown />

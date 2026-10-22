@@ -565,3 +565,16 @@ export function stepStop(
   const next = from < 0 ? undefined : stops[from + step]
   return next?.kind === 'record' ? next : null
 }
+
+/**
+ * The position among its Run's records, as Coral ordered them, of a record inside a
+ * Run: an Operation Invocation or any Program Run Event, its lifecycle included.
+ * Undefined for any other record, such as the Run itself or its final value, or when its Run's
+ * loaded window does not hold it.
+ */
+export function orderedRecordPosition(page: ActivityPage, row: ActivityRow | null) {
+  if (row?.kind !== 'invocation' && row?.kind !== 'output') return undefined
+  const branch = page.branches[row.run]
+  if (!branch || branch.unavailable) return undefined
+  return branch.rows.find((item) => item.name === row.name)?.position
+}
