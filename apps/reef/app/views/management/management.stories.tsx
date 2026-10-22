@@ -1,4 +1,4 @@
-import type { Meta, StoryObj } from '@storybook/react-vite'
+import type { Decorator, Meta, StoryObj } from '@storybook/react-vite'
 import { createRoutesStub } from 'react-router'
 import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { AgentActivityPage } from './agent-activity-page'
@@ -11,9 +11,17 @@ import { WorkspaceMembersPage, type WorkspaceMembersPageProps } from './workspac
 import { Activity } from '@/views/activity/activity'
 import type { ActivityRow, ActivityViewProps } from '@/views/activity/types'
 import { ActivitySummary } from '@/views/activity/summary/summary'
+import { ACTIVITY_PAGE_SIZE } from '@/lib/activity-list'
+import { resizeViewport } from '../../../.storybook/browser'
 import { WorkspaceOverview, type WorkspaceOverviewProps } from './workspace-overview'
 
 const form = { csrf: 'storybook-csrf', requestId: 'storybook-request' }
+// The app shell bounds a page's height; a story that scrolls inside it needs the same bound.
+const viewportHeight: Decorator = (Story) => (
+  <div style={{ height: '100vh' }}>
+    <Story />
+  </div>
+)
 const jordan = {
   user: 'users/jordan',
   name: 'Jordan Lee',
@@ -102,7 +110,7 @@ const emptyAgentActivity = activityPage([], agent.name)
 const emptyAgentGlimpse = activityPage([], agent.name, {
   to: `${agent.path}?view=activity`,
   label: 'View all activity',
-  roots: 3,
+  roots: ACTIVITY_PAGE_SIZE,
 })
 const overview: WorkspaceOverviewProps = {
   workspace,
@@ -359,14 +367,7 @@ export const ManyAgents: Story = {
     const [name] = within(rows[0]).getAllByRole('cell')
     await expect(name).toHaveAttribute('title', expect.stringContaining('reconciliation queue'))
   },
-  // The app shell bounds the page's height; the story needs a bound of its own.
-  decorators: [
-    (Story) => (
-      <div style={{ height: '100vh' }}>
-        <Story />
-      </div>
-    ),
-  ],
+  decorators: [viewportHeight],
 }
 /** The table keeps its shape with no agents, and offers to create one. */
 export const NoAgents: Story = {
@@ -458,6 +459,8 @@ const activityIntents = [
   'Summarize provider health signals',
   'Review unresolved approval requests',
 ]
+const busyIntent = (index: number) =>
+  `${activityIntents[index % activityIntents.length]} · batch ${index + 1}`
 const busyAgentActivityRows: ActivityRow[] = Array.from({ length: 36 }, (_, index) => {
   const ended = Date.UTC(2026, 8, 22, 9) - index * 3_600_000
   return {
@@ -466,7 +469,7 @@ const busyAgentActivityRows: ActivityRow[] = Array.from({ length: 36 }, (_, inde
     workspace: workspace.name,
     agent: agent.name,
     actor: agent.displayName,
-    intent: `${activityIntents[index % activityIntents.length]} · batch ${index + 1}`,
+    intent: busyIntent(index),
     outcome: index % 7 === 0 ? 'failure' : 'success',
     startedAt: new Date(ended - 90_000).toISOString(),
     endedAt: new Date(ended).toISOString(),
@@ -476,7 +479,7 @@ const busyAgentActivity = activityPage(busyAgentActivityRows, agent.name)
 const agentActivityGlimpse = activityPage(busyAgentActivityRows, agent.name, {
   to: `${agent.path}?view=activity`,
   label: 'View all activity',
-  roots: 3,
+  roots: ACTIVITY_PAGE_SIZE,
 })
 export const AgentActivity: Story = {
   render: () => (
@@ -490,6 +493,8 @@ export const AgentActivity: Story = {
     />
   ),
   parameters: { initialEntry: agent.path },
+  // The app shell bounds the page; the cards fill its height and scroll their rows.
+  decorators: [viewportHeight],
   play: async ({ canvas }) => {
     await expect(canvas.getByRole('link', { name: 'Settings' })).toHaveAttribute(
       'href',
@@ -498,6 +503,24 @@ export const AgentActivity: Story = {
     // Activity only reads; every change waits behind Settings.
     for (const name of ['Replace API key', 'Disable agent', 'Edit expiration', 'Delete agent'])
       await expect(canvas.queryByRole('button', { name })).toBeNull()
+    // Catches: a long list stretching its card past the page instead of scrolling its rows.
+    if (!(await resizeViewport(1440, 800))) return
+    const accounts = canvas.getByRole('region', { name: 'Accounts' })
+    const recent = canvas.getByRole('region', { name: 'Recent activity' })
+    await waitFor(() => {
+      for (const card of [accounts, recent])
+        expect(card.getBoundingClientRect().bottom).toBeLessThanOrEqual(window.innerHeight)
+      expect(accounts.getBoundingClientRect().top).toBe(recent.getBoundingClientRect().top)
+    })
+    const last = within(recent).getByRole('link', {
+      name: busyIntent(ACTIVITY_PAGE_SIZE - 1),
+    })
+    expect(last.getBoundingClientRect().top).toBeGreaterThan(recent.getBoundingClientRect().bottom)
+    expect(
+      within(recent).queryByRole('link', {
+        name: busyIntent(ACTIVITY_PAGE_SIZE),
+      }),
+    ).toBeNull()
   },
 }
 // Catches: a short viewport trapping Recent activity below the visible page.
@@ -517,13 +540,7 @@ export const AgentFullActivity: Story = {
   parameters: { initialEntry: `${agent.path}?view=activity` },
   // The app shell bounds the split page; the story needs the same height so
   // Activity scrolls its records instead of growing with them.
-  decorators: [
-    (Story) => (
-      <div style={{ height: '100vh' }}>
-        <Story />
-      </div>
-    ),
-  ],
+  decorators: [viewportHeight],
   play: async ({ canvas }) => {
     await expect(canvas.getByRole('heading', { name: 'Activity' })).toBeVisible()
     await expect(canvas.getByRole('link', { name: 'Back to agent' })).toHaveAttribute(
