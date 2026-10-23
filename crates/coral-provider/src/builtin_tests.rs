@@ -807,7 +807,7 @@ async fn management_reads_show_each_principal_the_builtin_operations_it_reaches(
     for (principal, reached) in [
         (
             AuthenticatedPrincipal::user(arranged.owner.clone()),
-            &["addProvider", "listProviders"][..],
+            &["addProvider", "getProvider", "listProviders"][..],
         ),
         (AuthenticatedPrincipal::user(member), &["listProviders"][..]),
         (agent, &["listProviders"][..]),
@@ -873,7 +873,9 @@ async fn management_reads_show_each_principal_the_builtin_operations_it_reaches(
                 .iter()
                 .map(|operation| operation.key.as_str())
                 .collect::<Vec<_>>();
-            assert_eq!(keys, reached, "{actor:?}, page of {page_size}");
+            let lookahead = usize::try_from(page_size).unwrap() + 1;
+            let expected = reached.iter().copied().take(lookahead).collect::<Vec<_>>();
+            assert_eq!(keys, expected, "{actor:?}, page of {page_size}");
         }
     }
 }

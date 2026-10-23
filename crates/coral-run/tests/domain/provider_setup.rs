@@ -2,6 +2,7 @@
 //! publishes it when nobody needs to sign in; otherwise the call returns the
 //! Reef page where a person finishes it. The call never waits for that person.
 //! `coral.workspace.listProviders` lists the Providers a Program can check first.
+//! `coral.workspace.getProvider` reads one Provider's Provider Configuration.
 use super::*;
 use coral_provider::{ProviderSetupId, ProviderSetupState};
 
@@ -401,7 +402,9 @@ async fn add_provider_returns_the_reef_page_that_finishes_its_setup() {
             "{access:?}"
         );
         // A Program can find the Setup again while a person finishes it.
-        let listed = scope.start(&scope.owner, list_providers("{}")).await;
+        let listed = scope
+            .start(&scope.owner, workspace_call("listProviders", "{}"))
+            .await;
         assert_eq!(
             final_value(&scope.terminal(&scope.owner, &listed).await).pointer("/data/setups"),
             Some(&serde_json::json!([{
@@ -1375,7 +1378,7 @@ async fn an_invalid_argument_names_what_to_correct() {
 // Catches: a Built-in Operation's reach that ignores the Workspace action it
 // declares, or a host that performs listProviders only for a User.
 #[tokio::test]
-async fn members_and_agents_list_providers_but_cannot_reach_add_provider() {
+async fn members_and_agents_list_providers_but_cannot_reach_add_or_get_provider() {
     let scope = AdminScope::new("user:admin-owner").await;
     scope.set_access(OperationAccessState::Enabled).await;
     scope.publish_weather().await;
@@ -1400,15 +1403,32 @@ async fn members_and_agents_list_providers_but_cannot_reach_add_provider() {
         registered_agent(&scope.fixture.workspaces, &scope.owner, &scope.workspace_id).await;
     let before = scope.lifecycle_events().await;
     for principal in [AuthenticatedPrincipal::user(member), agent] {
-        let run = scope
-            .start(&principal, add_provider(&serde_json::json!({ "namespace": "other", "source": document_source(), "credentialRoute": "none" }), "error.code"))
-            .await;
-        assert_final_code(
-            &scope.terminal(&principal, &run).await,
-            "operation_not_found",
-        );
+        for (operation, arguments) in [
+            (
+                "addProvider",
+                serde_json::json!({ "namespace": "other", "source": document_source(), "credentialRoute": "none" }),
+            ),
+            ("getProvider", serde_json::json!({ "namespace": "weather" })),
+        ] {
+            let run = scope
+                .start(
+                    &principal,
+                    workspace_call(operation, &arguments.to_string()),
+                )
+                .await;
+            assert_eq!(
+                final_value(&scope.terminal(&principal, &run).await),
+                serde_json::json!({
+                    "code": "operation_not_found",
+                    "message": "Operation Call Path was not found",
+                }),
+                "{operation}"
+            );
+        }
 
-        let run = scope.start(&principal, list_providers("{}")).await;
+        let run = scope
+            .start(&principal, workspace_call("listProviders", "{}"))
+            .await;
         let listed = final_value(&scope.terminal(&principal, &run).await);
         let call_roots = listed
             .pointer("/data/providers")
@@ -1484,18 +1504,20 @@ async fn the_source_fetch_uses_the_bootstrap_destination_policy() {
     assert_eq!(scope.setups_created_since(&before).await.len(), 1);
 }
 
-/// A Program that calls `listProviders` with `arguments`, the JavaScript
-/// argument list, and returns its Operation Result or the failure it catches.
-fn list_providers(arguments: &str) -> RunSubmission {
+/// A Program that calls the Built-in `operation` with `arguments`, the
+/// JavaScript argument list, and returns its Operation Result or the failure
+/// it catches.
+fn workspace_call(operation: &str, arguments: &str) -> RunSubmission {
     submission(
         &"
         try {
-            return await coral.workspace.listProviders(ARGUMENTS);
+            return await coral.workspace.OPERATION(ARGUMENTS);
         } catch (error) {
             if (!(error instanceof coral.OperationError)) throw error;
             return { code: error.code, message: error.message };
         }
     "
+        .replace("OPERATION", operation)
         .replace("ARGUMENTS", arguments),
     )
 }
@@ -1527,6 +1549,7 @@ async fn list_providers_lists_every_provider_without_approval() {
             "providers": [
                 {
                     "callRoot": "coral.workspace",
+                    "namespace": null,
                     "displayName": "Coral",
                     "state": "active",
                     "credentialRoute": "none",
@@ -1537,6 +1560,7 @@ async fn list_providers_lists_every_provider_without_approval() {
                 },
                 {
                     "callRoot": "coral.providers.weather",
+                    "namespace": "weather",
                     "displayName": "Weather",
                     "state": "disabled",
                     "credentialRoute": "none",
@@ -1570,7 +1594,9 @@ async fn list_providers_lists_every_provider_without_approval() {
             }),
         ),
     ] {
-        let run = scope.start(&scope.owner, list_providers(arguments)).await;
+        let run = scope
+            .start(&scope.owner, workspace_call("listProviders", arguments))
+            .await;
         assert_eq!(
             final_value(&scope.terminal(&scope.owner, &run).await),
             expected,
@@ -1587,4 +1613,145 @@ async fn list_providers_lists_every_provider_without_approval() {
             "{arguments}: no approval request"
         );
     }
+}
+
+/// An MCP server that lists one read-only tool to anyone.
+async fn public_mcp_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let request: serde_json::Value = request.body_json().expect("an MCP request");
+            let result = match request.get("method").and_then(serde_json::Value::as_str) {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "forecasts", "title": "Forecasts", "version": "1" },
+                }),
+                Some("tools/list") => serde_json::json!({ "tools": [{
+                    "name": "lookup",
+                    "inputSchema": { "type": "object" },
+                    "annotations": { "readOnlyHint": true },
+                }] }),
+                // A notification has no response body.
+                _ => return ResponseTemplate::new(202),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": request.get("id"), "result": result,
+            }))
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+// Catches: a read that differs from the configuration a Program saved, or
+// that returns an uploaded document.
+#[tokio::test]
+async fn get_provider_reads_back_the_configuration_a_program_saved() {
+    let scope = AdminScope::new("user:get-provider").await;
+    scope.set_access(OperationAccessState::Enabled).await;
+    let document_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DOCUMENT))
+        .mount(&document_server)
+        .await;
+    let mcp_server = public_mcp_server().await;
+    let document_url = format!("{}/openapi.json", document_server.uri());
+    let declared = serde_json::json!({
+        "#/servers": { "kind": "declared", "url": "https://weather.example", "variables": {} },
+    });
+    for (namespace, source, read_source, servers, request_headers) in [
+        (
+            "weatherUrl",
+            serde_json::json!({ "kind": "openapi_url", "url": document_url }),
+            serde_json::json!({ "kind": "openapi_url", "url": document_url }),
+            declared.clone(),
+            serde_json::json!({}),
+        ),
+        (
+            "forecasts",
+            serde_json::json!({ "kind": "mcp_url", "url": mcp_server.uri() }),
+            serde_json::json!({ "kind": "mcp_url", "url": mcp_server.uri() }),
+            // Coral saves the inspected server URL in its normalized form.
+            serde_json::json!({
+                "#/servers": { "kind": "custom", "url": format!("{}/", mcp_server.uri()) },
+            }),
+            serde_json::json!({ "x-tenant": "acme" }),
+        ),
+        (
+            "weatherDocument",
+            document_source(),
+            serde_json::json!({ "kind": "openapi_document" }),
+            declared.clone(),
+            serde_json::json!({ "x-trace": "on" }),
+        ),
+    ] {
+        let created = scope
+            .start(
+                &scope.owner,
+                add_provider(
+                    &serde_json::json!({
+                        "namespace": namespace,
+                        "source": source,
+                        "credentialRoute": "none",
+                        "displayName": "Saved weather",
+                        "requestHeaders": request_headers,
+                    }),
+                    "error.code",
+                ),
+            )
+            .await;
+        let created = final_value(&scope.terminal(&scope.owner, &created).await);
+        assert_eq!(
+            created.pointer("/data/status"),
+            Some(&serde_json::json!("published")),
+            "{namespace}: {created}"
+        );
+
+        let run = scope
+            .start(
+                &scope.owner,
+                workspace_call(
+                    "getProvider",
+                    &serde_json::json!({ "namespace": namespace }).to_string(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            final_value(&scope.terminal(&scope.owner, &run).await),
+            serde_json::json!({
+                "data": {
+                    "namespace": namespace,
+                    "state": "active",
+                    "displayName": "Saved weather",
+                    "source": read_source,
+                    "credentialRoute": "none",
+                    "servers": servers,
+                    "authentication": { "method": "none" },
+                    "requestHeaders": request_headers,
+                    "credentialFields": {},
+                },
+                "metadata": { "kind": "builtin" },
+            }),
+            "{namespace}"
+        );
+    }
+}
+
+// Catches: a namespace that no Provider holds read as something other than
+// not found.
+#[tokio::test]
+async fn get_provider_names_an_absent_provider() {
+    let scope = AdminScope::new("user:get-provider-absent").await;
+    let run = scope
+        .start(
+            &scope.owner,
+            workspace_call("getProvider", r#"{ "namespace": "forecasts" }"#),
+        )
+        .await;
+    assert_eq!(
+        final_value(&scope.terminal(&scope.owner, &run).await),
+        serde_json::json!({ "code": "provider_not_found", "message": "Provider was not found" }),
+    );
 }

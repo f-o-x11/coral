@@ -101,6 +101,13 @@ pub struct ListedProvider {
                        coral.providers.<namespace> for a Provider a person added, or \
                        coral.workspace for Coral's own.")]
     pub call_root: String,
+    /// The Provider Namespace; `None` for the Built-in Provider, which has
+    /// none.
+    #[schemars(
+        description = "The Provider Namespace, which getProvider takes. Null for Coral's own \
+                       Provider, which has none."
+    )]
+    pub namespace: Option<String>,
     /// Whether the Provider accepts calls.
     #[schemars(
         description = "Whether the Provider accepts calls. A disabled Provider still holds its \
@@ -112,8 +119,8 @@ pub struct ListedProvider {
     pub facts: ProviderFacts,
 }
 
-/// Whether a listed Provider accepts calls. A disabled one still holds its
-/// Call Root.
+/// Whether a Provider accepts calls. A disabled one still holds its Call
+/// Root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListedProviderState {

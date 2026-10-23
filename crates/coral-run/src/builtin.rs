@@ -1,6 +1,7 @@
 //! Built-in Provider Operations, which Coral performs itself with no upstream
 //! dispatch. Their input is validated before any other work, and their results
-//! never carry a secret or an OAuth URL.
+//! never carry a secret or the OAuth sign-in link Coral prepares for one
+//! person. A Provider's OAuth endpoints are configuration, not that link.
 //!
 //! coral-catalog owns each Operation's contract: its schemas, how its
 //! arguments are read, and the result it writes. Each module here performs
@@ -26,6 +27,7 @@ use crate::{
 };
 
 mod add_provider;
+mod get_provider;
 mod list_providers;
 
 /// One admitted Built-in Operation with its validated input.
@@ -33,6 +35,7 @@ mod list_providers;
 pub(crate) enum BuiltinCall {
     AddProvider(Box<add_provider::AddProvider>),
     ListProviders,
+    GetProvider(get_provider::GetProvider),
 }
 
 impl BuiltinCall {
@@ -58,6 +61,9 @@ impl BuiltinCall {
                             .map(|call| Self::AddProvider(Box::new(call)))
                     }
                     BuiltinArguments::ListProviders => Ok(Self::ListProviders),
+                    BuiltinArguments::GetProvider(arguments) => {
+                        get_provider::GetProvider::new(&arguments).map(Self::GetProvider)
+                    }
                 }),
         )
     }
@@ -67,6 +73,7 @@ impl BuiltinCall {
         match self {
             Self::AddProvider(call) => call.perform(host).await,
             Self::ListProviders => list_providers::perform(host).await,
+            Self::GetProvider(call) => call.perform(host).await,
         }
     }
 }
@@ -96,7 +103,7 @@ pub(crate) async fn recover(
             .map(Some),
         // A read leaves nothing behind, and this version cannot read an
         // Operation it does not perform.
-        Some(BuiltinOperation::ListProviders) | None => Ok(None),
+        Some(BuiltinOperation::ListProviders | BuiltinOperation::GetProvider) | None => Ok(None),
     }
 }
 

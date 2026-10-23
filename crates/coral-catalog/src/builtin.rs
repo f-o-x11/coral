@@ -33,10 +33,14 @@ use crate::{
 };
 
 mod add_provider;
+mod get_provider;
 mod list_providers;
 
 pub use add_provider::{
     AddProviderArguments, AddProviderResult, ConfigurationChoices, ProviderSourceArgument,
+};
+pub use get_provider::{
+    ConfigurationOutput, GetProviderArguments, GetProviderResult, ProviderSourceOutput,
 };
 pub use list_providers::{
     ListProvidersResult, ListedProvider, ListedProviderState, ListedSetup, ListedSetupState,
@@ -94,10 +98,13 @@ pub enum BuiltinOperation {
     /// Lists every Provider in the Workspace, so a Program can see which
     /// namespaces are taken before it adds one.
     ListProviders,
+    /// Reads one Provider's Provider Configuration, so a Program can change some
+    /// of it and send back only those fields.
+    GetProvider,
 }
 
 impl BuiltinOperation {
-    const ALL: [Self; 2] = [Self::AddProvider, Self::ListProviders];
+    const ALL: [Self; 3] = [Self::AddProvider, Self::ListProviders, Self::GetProvider];
 
     /// Returns the Operation Key, which is also its relative path.
     #[must_use]
@@ -105,6 +112,7 @@ impl BuiltinOperation {
         match self {
             Self::AddProvider => "addProvider",
             Self::ListProviders => "listProviders",
+            Self::GetProvider => "getProvider",
         }
     }
 
@@ -124,6 +132,7 @@ impl BuiltinOperation {
         match self {
             Self::AddProvider => add_provider::NEEDS,
             Self::ListProviders => list_providers::NEEDS,
+            Self::GetProvider => get_provider::NEEDS,
         }
     }
 }
@@ -261,6 +270,8 @@ pub enum BuiltinArguments {
     AddProvider(Box<AddProviderArguments>),
     /// `listProviders` takes none.
     ListProviders,
+    /// `getProvider`'s arguments.
+    GetProvider(GetProviderArguments),
 }
 
 impl BuiltinArguments {
@@ -279,6 +290,9 @@ impl BuiltinArguments {
                 .map(|arguments| Self::AddProvider(Box::new(arguments))),
             BuiltinOperation::ListProviders => {
                 list_providers::parse(arguments).map(|()| Self::ListProviders)
+            }
+            BuiltinOperation::GetProvider => {
+                GetProviderArguments::parse(arguments).map(Self::GetProvider)
             }
         }
     }
@@ -314,6 +328,10 @@ impl ArgumentProblem {
         &self.reason
     }
 }
+
+/// What to correct in a Provider Namespace that no Provider can hold.
+const NAMESPACE_REASON: &str =
+    "use a JavaScript identifier of at most 128 bytes, such as `weather`";
 
 /// Reads `arguments` as `T`, or names the first argument whose shape is wrong.
 fn read<T: DeserializeOwned>(arguments: &Value) -> Result<T, ArgumentProblem> {
@@ -516,6 +534,7 @@ fn definition(operation: BuiltinOperation) -> Definition {
     match operation {
         BuiltinOperation::AddProvider => add_provider::definition(),
         BuiltinOperation::ListProviders => list_providers::definition(),
+        BuiltinOperation::GetProvider => get_provider::definition(),
     }
 }
 
