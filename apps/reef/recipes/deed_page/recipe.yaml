@@ -5,7 +5,7 @@
 schema_version: 1
 id: deed_page
 display_name: deed.page
-description: Publish HTML or a folder of files as a public site on deed.page.
+description: Public sites from HTML or a folder of files on deed.page.
 source:
   mcp:
     url: https://deed.page/mcp
